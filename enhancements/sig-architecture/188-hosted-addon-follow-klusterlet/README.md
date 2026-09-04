@@ -129,7 +129,9 @@ on self-report can't take one down as a side effect.
 
 **A known gap is accepted rather than solved here.** Turning `ReportHostingCluster` back off leaves
 the last-published claim in place rather than deleting it, so validation and auto-discovery keep
-treating it as live until something else overwrites or removes it.
+treating it as live until something else overwrites or removes it. To remove the stale value, first
+set `reportHostingCluster` to `Disable`, then delete
+`ClusterClaim/hosting-cluster.open-cluster-management.io` from the target managed cluster.
 
 ## Design Details
 
@@ -166,7 +168,7 @@ type KlusterletDeployOption struct {
 	// Hosted.ManagementClusterName when they run on a separate management cluster - via a
 	// reserved ClusterClaim named "hosting-cluster.open-cluster-management.io". Disabled by
 	// default: the klusterlet-operator emits nothing and behaves exactly as it does today unless
-	// this is explicitly set to Enable.
+	// this is explicitly set to Enable. ClusterClaim cannot be disabled while reporting is enabled.
 	// +optional
 	ReportHostingCluster ReportHostingClusterMode `json:"reportHostingCluster,omitempty"`
 
@@ -193,6 +195,7 @@ type KlusterletHostedConfiguration struct {
 	// ManagementClusterName is the name (as known to the hub) of the cluster where this
 	// klusterlet's controllers actually run, for a mode where that's a separate management
 	// cluster rather than the klusterlet running locally.
+	// It must be set when reporting the hosting cluster in Hosted or SingletonHosted mode.
 	// +optional
 	ManagementClusterName string `json:"managementClusterName,omitempty"`
 }
@@ -201,14 +204,55 @@ type KlusterletHostedConfiguration struct {
 `ReportHostingCluster` is the only field this proposal adds; `Hosted` and `ManagementClusterName`
 already exist to support that mode's normal operation independent of self-report.
 
-Self-report's own logic only ever branches on whether `Hosted` is set, the same signal the klusterlet
-already uses to decide where its own controllers run. When unset, the controllers run locally, and
-self-report publishes the klusterlet's own pre-existing `Klusterlet.spec.ClusterName` (a sibling of
-`deployOption`, naming the cluster the klusterlet resource itself is for). When set, the controllers
-run on the named separate management cluster, and self-report publishes
-`Hosted.ManagementClusterName` instead. This proposal adds no new `Klusterlet.spec.deployOption.mode`
-value, and self-report keeps working unchanged if more modes of either kind are added later, since it
-never branches on `Mode` directly.
+The administrator enables self-report on the `Klusterlet` resource that deploys the registration
+agent. The required name and the value published by that agent depend on where its controllers run:
+
+| `spec.deployOption.mode` | Where controllers run | Required while reporting | Published claim value |
+|---|---|---|---|
+| omitted or `Default` | Target managed cluster | `spec.clusterName` | `spec.clusterName` |
+| `Singleton` | Target managed cluster | `spec.clusterName` | `spec.clusterName` |
+| `Hosted` | Separate management cluster | `spec.deployOption.hosted.managementClusterName` | `managementClusterName` |
+| `SingletonHosted` | Separate management cluster | `spec.deployOption.hosted.managementClusterName` | `managementClusterName` |
+
+For example, the administrator applies this resource to `spoke-a` when its agents run locally:
+
+```yaml
+apiVersion: operator.open-cluster-management.io/v1
+kind: Klusterlet
+metadata:
+  name: klusterlet
+spec:
+  clusterName: spoke-a
+  deployOption:
+    mode: Default
+    reportHostingCluster: Enable
+```
+
+For hosted agents, the administrator applies the following resource to `hosting-a`; the agents use
+the target cluster kubeconfig to publish `hosting-a` on `spoke-a`:
+
+```yaml
+apiVersion: operator.open-cluster-management.io/v1
+kind: Klusterlet
+metadata:
+  name: klusterlet-spoke-a
+spec:
+  clusterName: spoke-a
+  deployOption:
+    mode: Hosted
+    reportHostingCluster: Enable
+    hosted:
+      managementClusterName: hosting-a
+```
+
+`ClusterClaim` is enabled by default, so these examples need no additional feature-gate entry. The
+API rejects a `Klusterlet` that enables reporting while explicitly setting
+`spec.registrationConfiguration.featureGates[ClusterClaim]` to `Disable`, because that would create
+the claim on the target cluster without exposing it in the target's `ManagedCluster.status` on the
+hub. The API also rejects reporting without the mode-specific required name shown above. These
+checks do not apply while reporting is omitted or set to `Disable`, preserving existing klusterlet
+configurations.
+
 `hosting-cluster.open-cluster-management.io` joins
 [4-cluster-claims](../4-cluster-claims/README.md)'s existing list of reserved claim names, which are
 synced to the hub ahead of ordinary ones and aren't subject to the cap (20 by default) that mechanism
@@ -223,12 +267,12 @@ name under Kubernetes RBAC, since the object doesn't exist yet at authorization 
 every klusterlet's `ClusterRole` the moment its operator upgrades, whether or not any individual
 klusterlet ever turns the field on - the opt-in only governs whether the permission is ever used.
 
-Once on, the klusterlet keeps the claim in sync with whichever value is currently active - its own
-`ClusterName` in Default mode, `ManagementClusterName` in Hosted mode - on every reconcile, and clears
-it if that value is cleared. `Mode` itself isn't something this covers: it's already documented as set
-once and never changed, a pre-existing constraint this proposal doesn't alter. Turning the opt-in back
-off deliberately leaves the last-published claim in place rather than deleting it, keeping "off" a
-strict no-op rather than "no calls except one last cleanup" - see Risks and Mitigations above.
+Once on, the klusterlet keeps the claim in sync with the mode-specific value shown above on every
+reconcile. Admission validation prevents that value from being cleared while reporting remains
+enabled. `Mode` itself isn't something this covers: it's already documented as set once and never
+changed, a pre-existing constraint this proposal doesn't alter. Turning the opt-in back off
+deliberately leaves the last-published claim in place rather than deleting it, keeping "off" a strict
+no-op rather than "no calls except one last cleanup" - see Risks and Mitigations above.
 
 ### 2. Validation
 
@@ -439,6 +483,10 @@ since `Klusterlet` has only ever had one API version.
 
 ### Test Plan
 
+- API integration tests for the self-report prerequisites: Default and Singleton require
+  `spec.clusterName`; Hosted and SingletonHosted require `managementClusterName`; an explicit
+  `ClusterClaim: Disable` is rejected while reporting is enabled; omitted/default and explicit
+  `ClusterClaim: Enable` configurations are accepted; and an update cannot remove a required name.
 - Unit tests covering every branch of validation and the opt-in gate: no self-report, confirmed
   match, confirmed mismatch on both a never-deployed and an already-deployed addon,
   `HostingClusterAutoDiscoveryPending` both with and without a self-report already present and only
@@ -502,6 +550,7 @@ above for as long as that side stays behind, rather than introducing anything ne
 ## Implementation History
 
 - 2026-08-11: Initial proposal.
+- 2026-09-04: Added admission prerequisites for self-reporting.
 
 ## Alternatives
 
