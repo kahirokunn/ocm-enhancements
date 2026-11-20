@@ -23,6 +23,10 @@ The driver supports the `Default` and `Singleton` Klusterlet install modes and a
 model to add-ons. The `Hosted` and `SingletonHosted` modes are not supported: the Klusterlet API
 refuses `spiffe` in them. Supporting them is a feature to do later.
 
+An add-on agent reaches the hub only through the gRPC server. An add-on whose agent needs the hub
+kube-apiserver, or a certificate signed on the hub, cannot run on a `spiffe` cluster until it is
+changed (see [Add-ons](#add-ons)).
+
 The driver is new. It reuses the CloudEvents-over-gRPC transport, the per-resource gRPC services
 and the SubjectAccessReview authorizer from [gRPC based registration](../141-grpc-based-registration/README.md),
 but replaces its entire identity layer.
@@ -60,8 +64,9 @@ certificate authority.
   not sign anything.
 - Apart from the local SPIRE agent's Workload API, OCM contacts no other identity or key service
   (no KMS, cloud identity provider, OIDC endpoint or SPIRE server API).
-- Keep the hub-side user experience unchanged: ManagedCluster acceptance, add-on enablement, RBAC,
-  ManifestWork and add-on APIs work as today.
+- Keep the hub-side user experience unchanged for clusters: ManagedCluster acceptance, RBAC and
+  ManifestWork work as today. Add-ons are enabled the same way and their APIs are unchanged, but
+  an add-on's agent has to be written for this driver (see [Add-ons](#add-ons)).
 - Allow existing clusters to move to the new driver one at a time.
 
 ### Non-Goals
@@ -270,6 +275,32 @@ longer obtains credentials on the add-on's behalf.
 If an add-on sets a custom `kubeClient` subject that does not match the mapping for its SPIFFE ID,
 the add-on manager sets `RegistrationApplied` to false with a clear reason, because no SVID can
 carry that subject.
+
+**The agent name must be fixed.** The `<agent>` part of an add-on agent's SPIFFE ID is the agent
+name in the user of the add-on's `kubeClient` subject, `...:addon:<addon>:agent:<agent>`. The
+platform creates a SPIRE entry for that ID, so the name has to stay the same. An add-on that
+passes a random agent name to the add-on framework, as the framework's examples do today, gets a
+new ID every time its manager restarts, and has to pass a fixed one. Add-on templates already use
+`<addon>-agent`. With a fixed name, the ID follows from the template, the cluster, the add-on and
+the agent name, so the platform can create the entry before the add-on is enabled (see
+[Operators](#operators) for an example entry). The registration agent also writes the rendered ID
+to the add-on's `<addon>-spiffe` ConfigMap on the managed cluster.
+
+**What an add-on agent can do on the hub.** In this mode an add-on agent has no kubeconfig for the
+hub kube-apiserver. It can use only the resources the hub gRPC server serves, as far as the
+add-on's hub RBAC allows: read its own `ManagedClusterAddOn` and update its status and, if
+granted, send leases and events in the cluster namespace. The SPIFFE listener serves no CSR and no
+token request, so the agent cannot get another credential through it. Example: the agent of the
+`helloworld-spiffe` add-on sets a condition on its `ManagedClusterAddOn` every 30 seconds, and
+that is all it does on the hub.
+
+**Add-ons that cannot run on a `spiffe` cluster yet.** An add-on whose agent reads or writes other
+hub resources with a hub kubeconfig, such as managed-serviceaccount, or needs a certificate from a
+`customSigner`, such as cluster-proxy, does not work on a cluster that uses this driver. Its
+`ManagedClusterAddOn` shows why. Because `addOnKubeClientRegistrationDriver` must be `spiffe` when
+the registration driver is, this holds for every add-on on the cluster. Such an add-on has to be
+changed to use the gRPC services, or wait until the gRPC server offers a way to reach other hub
+resources (see [Graduation Criteria](#graduation-criteria)).
 
 **Renew.** Exactly as for the Klusterlet agents: SPIRE rotates the add-on agent's SVID, and the
 hub closes connections whose SVID has expired.
@@ -820,7 +851,8 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   never created.
 - `pkg/spiffeclient` is the client helper: it reads the `<addon>-spiffe` settings from the mounted
   directory, opens the Workload API and builds the gRPC options.
-- An example add-on, `helloworld-spiffe`, shows a manager and an agent written for the driver.
+- An example add-on, `helloworld-spiffe`, shows a manager and an agent written for the driver,
+  with a fixed agent name.
 
 #### clusteradm
 
@@ -1058,7 +1090,9 @@ All open questions are decided.
   admission webhook lets only the hub gRPC server and users with `managedclusters/accept` set or
   change the two annotations. With `spiffe` enabled next to `csr` and `grpc`, check that a `csr`
   agent on the hub kube-apiserver and a `grpc` agent on its listener can still read only their
-  own `ManagedCluster` and create no other.
+  own `ManagedCluster` and create no other. For add-ons, check that a `customSigner` registration,
+  and a `kubeClient` subject that no SVID can carry, are reported on the `ManagedClusterAddOn` and
+  not served.
 - **API tests.** The `Klusterlet` CRD accepts `spiffe` with `deployOption.mode` empty, `Default`
   or `Singleton`, refuses it with `Hosted` and `SingletonHosted`, still accepts other drivers in
   the hosted modes, and refuses moving a `spiffe` Klusterlet to a hosted mode.
@@ -1080,6 +1114,9 @@ All open questions are decided.
   - `clusteradm join` warns when a subject other than cluster admins and OCM's ServiceAccounts
     holds, in one of OCM's namespaces, a permission that the managed cluster's RBAC must not grant
     (see Operators).
+  - A decision on add-ons that need other hub resources: either a way to reach them through the
+    gRPC server, for example a generic resource service, or a statement that they are not
+    supported with this driver.
 - **GA.** Used in production by at least one adopter, with migration from the `grpc` driver
   documented and tested.
 
@@ -1144,6 +1181,8 @@ All open questions are decided.
   pin an explicit admin step for every cluster a SPIFFE agent did not create.
 - 2026-11-20: Replaced the wait after a cluster deletion with a deletion record: the hub refuses
   SVIDs issued before the deletion, and the `ManagedCluster` is removed without delay.
+- 2026-11-20: Stated what an add-on agent can do on the hub in this mode, which add-ons cannot run
+  on a `spiffe` cluster yet, and that an add-on's agent name must be fixed.
 
 ## Drawbacks
 
@@ -1152,8 +1191,10 @@ All open questions are decided.
 - The security of cluster and add-on identity moves to SPIRE configuration (registration entries
   and node attestation), which OCM cannot validate. It also rests on the managed cluster's RBAC,
   as with the existing drivers.
-- Add-ons that need direct hub kube-apiserver access, or hub-signed certificates, must be changed
-  to use the gRPC services and their SVID.
+- Add-ons whose agents need direct hub kube-apiserver access, or hub-signed certificates, do not
+  work on a `spiffe` cluster; cluster-proxy and managed-serviceaccount are two of them today. They
+  must be changed to use the gRPC services and their SVID, and the gRPC server serves only a fixed
+  set of resources.
 - Clusters in `Hosted` or `SingletonHosted` mode cannot use the driver until the hosted modes are
   supported.
 
