@@ -160,9 +160,10 @@ carries that group, so a permission bound to it can be used only through the SPI
 "Register" under [Lifecycle](#lifecycle)).
 
 The platform must make sure SPIRE only issues `.../cluster/<cluster>/...` IDs to workloads that
-really belong to cluster `<cluster>`, for example by binding registration entries to the node
-attestation of the SPIRE agents that run that cluster's agents. See
-[Risks and Mitigation](#risks-and-mitigation).
+really belong to cluster `<cluster>`. One part is binding registration entries to the node
+attestation of the SPIRE agents that run that cluster's agents. The other part is who may write
+the entries: whoever can register entries for a trust domain can register any ID in it, another
+cluster's included. See [Risks and Mitigation](#risks-and-mitigation).
 
 ### Install modes
 
@@ -607,7 +608,9 @@ components that can act as a cluster's agents:
 - Hub users who can create `ManifestWork`s for the cluster that run with the work agent's own
   permissions (the default executor). The work agent applies their manifests, and it is `admin`
   in every namespace of the managed cluster, the agent namespace included.
-- The platform that writes the SPIRE registration entries.
+- Whoever can write SPIRE registration entries for the trust domain, or sign for it. They can
+  register any ID in the trust domain, not only this cluster's (see
+  [Risks and Mitigation](#risks-and-mitigation)).
 
 Apart from the last one, the existing drivers trust the same set: there, the same people can read
 the `hub-kubeconfig-secret`, or start a pod that mounts it. What changes is what they get. With
@@ -943,6 +946,27 @@ select on namespace, ServiceAccount and role label (see Operators). The hub also
 request is about the cluster named in the SVID, so an agent of cluster2 can never change
 cluster1's resources, even with a valid SVID. This is documented as a deployment requirement.
 
+**A managed cluster registers another cluster's ID.**
+SPIRE checks which workload gets an entry's ID, not which IDs an entry may name. Example: the SPIRE
+server takes its entries from `ClusterSPIFFEID` objects on each managed cluster. An admin of
+cluster2 creates one with `spiffe://ocm-hub.example.org/ocm/cluster/cluster1/agent/work` for a pod
+on cluster2. The SPIRE controller manager checks only the trust domain of that ID, so SPIRE issues
+the SVID, and the pod acts as cluster1 on the hub. The hub server's ID can be registered the same
+way, and a nested SPIRE server on a managed cluster can sign any ID in the trust domain.
+*Mitigation:* with this driver, whoever can write entries for a trust domain, or sign for it, is
+trusted with every identity in it. With the existing drivers that is only the hub, which signs
+every certificate. Where managed clusters must not be able to act for each other, the platform
+has two ways:
+
+- Keep entry writing off the managed clusters. The platform creates each cluster's entries on the
+  SPIRE server itself, from the IDs in `status.spiffe.agentIDs`, and the managed clusters run only
+  SPIRE agents.
+- Give each managed cluster its own trust domain, federated with the hub's. A trust domain can
+  then issue IDs only for the clusters pinned to it (see "Trust domains"), and it cannot issue the
+  hub's ID.
+
+This is documented as a deployment requirement, next to the RBAC requirement.
+
 **The managed cluster's RBAC is too broad.**
 Example: a team has `edit` in every namespace. Its members can start a pod with the work agent's
 ServiceAccount and role label in the agent namespace, or open a shell in the work agent's pod, and
@@ -1099,6 +1123,12 @@ All open questions are decided.
    through an internal load balancer. Nested SPIRE servers look the same to OCM. Federated trust
    domains, one per cluster, stay supported, and the e2e tests still cover one federated cluster
    so that trust domain pinning is tested.
+
+   A shared trust domain keeps the clusters apart only if the managed clusters cannot write its
+   registration entries or sign for it. The e2e tests take each cluster's entries from
+   `ClusterSPIFFEID` objects on that cluster, which is simple but lets its admins register any ID
+   in the trust domain; so can a nested SPIRE server there. A platform that must keep its clusters
+   apart writes the entries itself, or uses one trust domain per cluster (see Risks).
 5. **Hosted modes.** Decided: the `Hosted` and `SingletonHosted` modes are not part of this
    proposal, because their agents need a stored kubeconfig for the managed cluster. Supporting
    them is a feature to do later, for example with the agents reaching the managed cluster's
@@ -1259,14 +1289,17 @@ All open questions are decided.
   on a `spiffe` cluster yet, and that an add-on's agent name must be fixed.
 - 2026-11-20: Added user stories, the list of new names, the downgrade steps, and Beta criteria
   for client-side reconnect and for reporting the hub connection.
+- 2026-11-20: Stated that whoever can write registration entries for a shared trust domain can
+  act as any cluster in it, and how a platform keeps its clusters apart.
 
 ## Drawbacks
 
 - Requires a SPIRE deployment, with SPIRE agents on the hub and every managed cluster, which is
   significant operational work for users who do not already run it.
 - The security of cluster and add-on identity moves to SPIRE configuration (registration entries
-  and node attestation), which OCM cannot validate. It also rests on the managed cluster's RBAC,
-  as with the existing drivers.
+  and node attestation), which OCM cannot validate. Whoever can write entries for a shared trust
+  domain can act as any cluster in it; with the existing drivers only the hub can issue an
+  identity. It also rests on the managed cluster's RBAC, as with the existing drivers.
 - Add-ons whose agents need direct hub kube-apiserver access, or hub-signed certificates, do not
   work on a `spiffe` cluster; cluster-proxy and managed-serviceaccount are two of them today. They
   must be changed to use the gRPC services and their SVID, and the gRPC server serves only a fixed
