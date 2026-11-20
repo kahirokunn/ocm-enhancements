@@ -123,7 +123,7 @@
   <text x="795" y="768" text-anchor="middle" class="label">17. watch event</text>
 
   <line x1="680" y1="810" x2="450" y2="810" class="msg" marker-end="url(#arrow)"/>
-  <text x="565" y="803" text-anchor="middle" class="label">18. close c1 streams; deny calls</text>
+  <text x="565" y="803" text-anchor="middle" class="label">18. close c1 connections; deny calls</text>
 
   <line x1="1110" y1="850" x2="230" y2="850" stroke="#777" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrow-grey)"/>
   <text x="670" y="843" text-anchor="middle" class="label grey">19. optional: delete SPIRE entries; no new SVIDs, current ones lapse within their TTL</text>

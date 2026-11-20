@@ -104,12 +104,42 @@ certificate authority.
 - **Agents** verify that the server presents the exact hub SPIFFE ID, so a load balancer or a
   certificate from the same trust domain cannot impersonate the hub.
 
+### User Stories
+
+#### Story 1: join a cluster without a bootstrap token
+
+As a platform engineer who already runs SPIRE, I want a managed cluster to join the hub with the
+identity SPIRE gives its agents. I create the SPIRE entries for the IDs that `clusteradm join`
+prints, and an admin accepts the cluster. No token or kubeconfig is handed over, and OCM has
+nothing of its own to rotate afterwards.
+
+#### Story 2: move one existing cluster
+
+As a hub admin, I want to move one `csr` cluster to `spiffe` without touching the others. I add
+`spiffe` to the hub's drivers, pin that one cluster to its trust domain, and switch its
+Klusterlet. The cluster keeps its `ManagedCluster`, `ManifestWork`s and RBAC, and the other
+clusters keep working with their current credentials.
+
+#### Story 3: remove a cluster and keep it out
+
+As a hub admin, I want a deleted cluster to stay deleted. I delete the `ManagedCluster`, and it is
+gone as soon as its `ManifestWork`s are cleaned up. The agent's SVIDs from before the deletion are
+refused, and once the platform has removed the cluster's SPIRE entries the agent gets no new ones.
+
+#### Story 4: write an add-on agent with no hub kubeconfig
+
+As an add-on author, I want my agent to report to the hub without a stored credential. I build its
+hub client with the add-on framework's helper and give the agent a fixed name. The agent then
+updates its `ManagedClusterAddOn` with its own SVID.
+
 ### SPIFFE ID scheme
 
-The hub derives the OCM identity from the path of the client's SPIFFE ID, so no per-cluster
-configuration is needed on the hub. The user and group names match what the `csr` and `grpc`
-drivers and the add-on framework use today, so the existing RBAC created by the registration
-controller and the add-on manager, and the existing identity checks, apply without change.
+The hub derives the OCM identity from the path of the client's SPIFFE ID, so it needs no
+per-cluster mapping. The groups are the ones the `csr` and `grpc` drivers and the add-on framework
+use today, and the user names have the same form; today the last part of a Klusterlet agent's user
+name is a random agent name. The existing RBAC created by the registration controller and the
+add-on manager is bound to the groups, so it applies without change, and so do the existing
+identity checks.
 
 | Workload | SPIFFE ID | OCM user | OCM groups |
 | --- | --- | --- | --- |
@@ -503,6 +533,25 @@ the add-on authenticates. No new registration type is needed.
 
 All new fields sit behind a new `SPIFFERegistration` feature gate.
 
+**New names at a glance.**
+
+| Kind | Name | On | Set by |
+| --- | --- | --- | --- |
+| Feature gate | `SPIFFERegistration` | hub and agents | admin |
+| Annotation | `open-cluster-management.io/spiffe-trust-domain` | `ManagedCluster` | hub gRPC server, or a user who may accept the cluster |
+| Annotation | `open-cluster-management.io/spiffe-registered-by` | `ManagedCluster` | hub gRPC server |
+| Annotation | `agent.open-cluster-management.io/klusterlet-name` | `ManagedCluster` | registration agent of a `spiffe` Klusterlet |
+| Finalizer | `open-cluster-management.io/spiffe-revocation` | `ManagedCluster` | registration controller |
+| Group | `system:open-cluster-management:spiffe-agents` | Klusterlet agents on the SPIFFE listener | hub gRPC server |
+| Label | `open-cluster-management.io/spiffe-role` | agent and add-on Pods | klusterlet operator, add-on framework |
+| Condition | `SPIFFEAgentRolePolicyApplied` | `Klusterlet` | klusterlet operator |
+| Condition reasons | `InvalidSPIFFEConfiguration`, `SPIFFEInstallModeNotSupported` | `Klusterlet`, `Applied` | klusterlet operator |
+| Condition reason | `SubjectNotSupportedBySPIFFE` | `ManagedClusterAddOn`, `RegistrationApplied` | add-on manager |
+| ConfigMap | `<addon>-spiffe` | add-on install namespace | registration agent |
+| ConfigMap | deletion record, named after the deleted cluster's UID | hub namespace | registration controller |
+| Listener | `grpc-spiffe`, Service `cluster-manager-grpc-server-spiffe` | hub | cluster-manager operator |
+| ClusterRole | `klusterlet-spiffe` | managed cluster | Helm chart or kustomize |
+
 #### Operators
 
 **Hub (cluster-manager operator).** Today it gives the gRPC server Secrets: the hub signing key
@@ -716,6 +765,12 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   agent's SVID and accepts only the configured hub ID:
   `tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeID(hubSPIFFEID))`. A server that
   presents any other ID, even one from the same trust domain, is refused.
+
+  In Alpha the client reconnects only after the hub has closed the connection at SVID expiry. For
+  Beta the client reconnects by itself: when SPIRE delivers a renewed SVID, it opens a new
+  connection with it, moves its subscriptions over and closes the old one, long before the old
+  SVID expires. The hub's close at expiry stays as a backstop, and such a close no longer makes
+  the client's reconnect wait grow.
 - **New dependency:** `github.com/spiffe/go-spiffe/v2`.
 
 #### ocm
@@ -736,8 +791,9 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   `system:open-cluster-management:cluster:cluster1:addon:my-addon:agent:my-addon-agent` matches
   `spiffe://ocm-hub.example.org/ocm/cluster/cluster1/addon/my-addon/agent/my-addon-agent`, but a
   custom user such as `my-team-bot` cannot, so the add-on gets a `RegistrationApplied=False`
-  condition with reason `SubjectNotSupportedBySPIFFE`. The comparison uses the full mapped identity, including `system:authenticated`, so a
-  default subject that lists that group still matches.
+  condition with reason `SubjectNotSupportedBySPIFFE`. The comparison uses the full mapped
+  identity, including `system:authenticated`, so a default subject that lists that group still
+  matches.
 - **gRPC server** (`pkg/server/grpc`). The `spiffe` driver gets its own listener, on its own port
   and Service (`cluster-manager-grpc-server-spiffe`), exposed through an `endpointsExposure` entry
   with `protocol: grpc-spiffe`. That listener uses only the SPIFFE TLS credentials and the SPIFFE
@@ -954,9 +1010,10 @@ Add-on entries select on the add-on's namespace and ServiceAccount.
 **SPIRE is down.**
 If an agent cannot reach its local Workload API, it cannot get a new SVID.
 *Mitigation:* open connections keep working until the current SVID expires. Example: with a 1-hour
-TTL rotated every 30 minutes, an agent has about 30 minutes of margin. The Klusterlet or
-`ManagedClusterAddOn` shows a clear condition while the Workload API is unreachable. The TTL is a
-platform choice: shorter means faster revocation, longer means more time to fix SPIRE.
+TTL rotated every 30 minutes, an agent has about 30 minutes of margin. An agent that starts
+without an SVID for its ID, or loses it, reports that through its `spiffe-svid` health check, with
+the ID it expects and the IDs it received, and the agent Deployment's status shows it. The TTL is
+a platform choice: shorter means faster revocation, longer means more time to fix SPIRE.
 
 **A connection outlives its SVID.**
 A gRPC connection checks identity only once, when it opens.
@@ -973,8 +1030,10 @@ SVIDs, `ManifestWork` changes arrived up to 112 s late. The work agent of `Defau
 single connection, but its wait grows the same way when SVIDs expire more often than every 10
 minutes: with 2-minute SVIDs its second reconnect waited 41–45 s, and about one change in 14
 arrived more than 30 s late. None was lost in either mode.
-*Mitigation:* use SVIDs of 1 hour or more, so this happens at most once every 30 minutes. The fix
-belongs in the client: a wait per connection, and a close at SVID expiry not counted as a failure.
+*Mitigation:* in Alpha, use SVIDs of 1 hour or more, so this happens at most once every 30
+minutes. For Beta, the client reconnects by itself when its SVID is renewed, before the hub closes
+the connection, and a close at SVID expiry is not counted as a failure (see Client TLS under
+sdk-go). The hub's close at expiry then only catches a client that did not reconnect.
 
 **A load balancer ends TLS in front of the hub.**
 Example: an HTTPS load balancer that decrypts traffic and re-encrypts it with its own certificate.
@@ -1117,6 +1176,10 @@ All open questions are decided.
   - A decision on add-ons that need other hub resources: either a way to reach them through the
     gRPC server, for example a generic resource service, or a statement that they are not
     supported with this driver.
+  - The client reconnects when its SVID is renewed, before the hub closes the connection at
+    expiry, so work no longer arrives late after an SVID expires (see sdk-go).
+  - A `Klusterlet` condition that reports whether the agents reach the hub in `spiffe` mode: hub
+    unreachable, wrong hub SPIFFE ID, or an SVID the hub refuses.
 - **GA.** Used in production by at least one adopter, with migration from the `grpc` driver
   documented and tested.
 
@@ -1128,23 +1191,33 @@ All open questions are decided.
 - The hub can enable `spiffe` alongside existing drivers in `registrationDrivers`, so clusters
   move one at a time. The `spiffe` listener runs next to the existing `grpc` listener (see the gRPC
   server under ocm), so agents that have not migrated keep their current endpoint and credentials.
-- Because the OCM user and group names are the same as with the `csr` and `grpc` drivers and the
-  add-on framework defaults, an existing cluster keeps its ManagedCluster, namespace,
-  ManifestWorks, add-ons and RBAC when its Klusterlet switches to `spiffe`. An admin first pins
-  the cluster to its trust domain, for example with
+- Because the OCM groups are the same as with the `csr` and `grpc` drivers and the add-on
+  framework defaults, and the hub RBAC is bound to the groups, an existing cluster keeps its
+  ManagedCluster, namespace, ManifestWorks, add-ons and RBAC when its Klusterlet switches to
+  `spiffe`. An admin first pins the cluster to its trust domain, for example with
   `clusteradm accept --clusters cluster1 --spiffe-trust-domain ocm-hub.example.org`; until then the
   hub serves no SPIFFE agent for it. Once the registration agent is connected with its SVID, it
-  deletes the old `hub-kubeconfig-secret`
-  and `bootstrap-hub-kubeconfig`, and, for each add-on, the `<addon>-hub-kubeconfig` Secret once
-  it has written the add-on's `<addon>-spiffe` ConfigMap.
+  deletes the old `hub-kubeconfig-secret` and `bootstrap-hub-kubeconfig`, and, for each add-on,
+  the `<addon>-hub-kubeconfig` Secret once it has written the add-on's `<addon>-spiffe` ConfigMap.
 - Before the switch, the platform checks the managed cluster's RBAC (see Operators). Add-ons keep
   their install namespaces, shared ones included.
 - Switching between `Default` and `Singleton` works as today. A Klusterlet in `Hosted` or
   `SingletonHosted` mode cannot switch to `spiffe`, and a `spiffe` Klusterlet cannot switch to a
   hosted mode; the API refuses both. Such clusters keep their current driver until the hosted
   modes are supported.
-- Downgrade: switch the Klusterlet back to its previous drivers and provide a bootstrap
-  kubeconfig, as for a new join.
+- Downgrade of a cluster: switch the Klusterlet back to its previous drivers and provide a
+  bootstrap kubeconfig, as for a new join. The klusterlet operator removes the agent role policy
+  and its binding and clears `status.spiffe`. The registration agent deletes each add-on's
+  `<addon>-spiffe` ConfigMap once the add-on's registration uses another driver. On the hub, the
+  cluster's `spiffe-trust-domain` and `spiffe-registered-by` annotations stay and mean nothing to
+  the other drivers; an admin can remove them.
+- Downgrade of the hub: remove `spiffe` from `registrationDrivers` first, while the hub still runs
+  a version that knows the driver. The registration controller then removes the
+  `spiffe-revocation` finalizer from every `ManagedCluster`, and the operator removes the SPIFFE
+  listener, its Service and the pre-acceptance ClusterRole and binding. A hub downgraded without
+  that step keeps the finalizer on its clusters, and an admin has to remove it by hand before
+  they can be deleted. Deletion records that are left over are plain ConfigMaps and can be
+  deleted.
 
 ### Version Skew Strategy
 
@@ -1156,7 +1229,8 @@ All open questions are decided.
   older hub there is no SPIFFE listener, so the agents can't connect: they log the error and
   retry, and the `ManagedCluster` is never created or stops being updated. The Klusterlet's
   `HubConnectionDegraded` condition doesn't show it, because with `spiffe` the operator has no
-  hub kubeconfig to check.
+  hub kubeconfig to check. Reporting the hub connection of a `spiffe` Klusterlet in a condition
+  is a Beta criterion.
 - Older agents keep using their existing drivers against a newer hub.
 - A `spiffe` Klusterlet in a hosted mode created under a CRD without the install-mode rule is
   refused by a newer klusterlet operator, which deploys no agent for it (see API).
@@ -1183,6 +1257,8 @@ All open questions are decided.
   SVIDs issued before the deletion, and the `ManagedCluster` is removed without delay.
 - 2026-11-20: Stated what an add-on agent can do on the hub in this mode, which add-ons cannot run
   on a `spiffe` cluster yet, and that an add-on's agent name must be fixed.
+- 2026-11-20: Added user stories, the list of new names, the downgrade steps, and Beta criteria
+  for client-side reconnect and for reporting the hub connection.
 
 ## Drawbacks
 
