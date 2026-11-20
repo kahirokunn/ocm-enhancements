@@ -119,6 +119,11 @@ path does not match this scheme, any request where the cluster in the event diff
 cluster in the SVID, and any add-on request where the add-on in the event differs from the add-on
 in the SVID.
 
+The hub also puts every Klusterlet agent it authenticates with an SVID in the group
+`system:open-cluster-management:spiffe-agents`. No certificate or token for the hub kube-apiserver
+carries that group, so a permission bound to it can be used only through the SPIFFE listener (see
+"Register" under [Lifecycle](#lifecycle)).
+
 The platform must make sure SPIRE only issues `.../cluster/<cluster>/...` IDs to workloads that
 really belong to cluster `<cluster>`, for example by binding registration entries to the node
 attestation of the SPIRE agents that run that cluster's agents. See
@@ -198,12 +203,15 @@ publish a CA bundle for agents; agents get the trust bundle from their own local
 6. The agent sees the accepted status and starts lease, status, ManifestWork and add-on sync.
 
 There is no bootstrap stage. Before acceptance, the agent's identity is authorized only to create,
-get, list and watch its own `ManagedCluster`, through a ClusterRole bound to
-`system:open-cluster-management:spiffe-agents`, a group only the hub's SPIFFE authenticator gives.
-The agents of the `csr` and `grpc` drivers carry `system:open-cluster-management:managed-clusters`
-in their certificates too, so a role bound to that group would also reach them and give them every
-`ManagedCluster`. The hub's CSR approval accepts no other group in a certificate, so they can't get
-`spiffe-agents`.
+get, list and watch its own `ManagedCluster`. The ClusterRole for this cannot name the cluster, so
+it covers every `ManagedCluster`; the SPIFFE listener is what holds each agent to its own. The
+ClusterRole is therefore bound to `system:open-cluster-management:spiffe-agents`, a group that
+only the SPIFFE listener assigns, and not to `system:open-cluster-management:managed-clusters`.
+The agents of the `csr` and `grpc` drivers are in `managed-clusters` too, and neither the hub
+kube-apiserver nor the existing `grpc` listener holds them to their own cluster for
+`ManagedCluster` requests. Bound to that group, the ClusterRole would let such an agent, on a hub
+with both drivers, list every `ManagedCluster` and create new ones. The hub CSR approval does
+not allow `spiffe-agents` in agent certificates.
 
 **Renew.**
 
@@ -219,8 +227,9 @@ in their certificates too, so a role bound to that group would also reach them a
 
 - **In OCM, immediate.** The hub gRPC server watches `ManagedCluster` and, when a cluster is
   denied (`hubAcceptsClient: false`) or deleted, or its trust-domain pin changes, closes every
-  open connection whose SVID belongs to that cluster, including its add-on agents. On reconnect,
-  the authorizer then allows only:
+  open connection whose SVID belongs to that cluster, including its add-on agents. After a pin
+  change, the listener refuses SVIDs from the previous trust domain. On reconnect, the authorizer
+  limits what denied or deleted clusters can do:
   - for a denied cluster, its own `ManagedCluster`, lease and events, so the registration agent
     sees when the cluster is accepted again. Work and add-on requests are refused;
   - for a cluster being deleted, `ManifestWork` requests from its work agent (or singleton agent),
@@ -376,12 +385,19 @@ in `agentTrustDomains`; its SPIRE must federate with those trust domains. Each `
 pinned to one trust domain, in the annotation `open-cluster-management.io/spiffe-trust-domain`:
 
 - When an agent creates its cluster, the hub sets the annotation from the trust domain of the
-  agent's SVID, whatever the request says. Agents can't change it later; only hub users with
-  update access to `ManagedCluster`s can.
-- A cluster created without it, by an admin or before the switch from another driver, is pinned to
-  the hub's only agent trust domain when there is just one. With several, the admin sets the
-  annotation, or runs `clusteradm accept --spiffe-trust-domain`, which sets it on an unpinned
-  cluster and refuses to accept one pinned to another trust domain.
+  agent's SVID, whatever the request says.
+- A cluster created any other way, by an admin or before the switch from another driver, has no
+  pin. The hub serves no SPIFFE agent for it until an admin pins it: by setting the annotation, or
+  with `clusteradm accept --spiffe-trust-domain`, which sets it on an unpinned cluster and refuses
+  to accept one pinned to another trust domain. This holds with one agent trust domain as well as
+  with several. Turning on the `spiffe` driver therefore changes nothing for the clusters that
+  are already there: SPIRE can speak for a cluster only after an admin has said so for that
+  cluster.
+- Only the hub gRPC server and users who may accept the cluster can set or change the pin. That
+  is the `managedclusters/accept` permission, which guards `hubAcceptsClient` today. The hub's
+  `ManagedCluster` admission webhook refuses the change from anyone else, on create and on update.
+  So an agent of another driver, which updates its `ManagedCluster` on the hub kube-apiserver
+  directly, can neither pin its cluster nor move it.
 - The hub refuses every request for a cluster from an SVID in any other trust domain, for the
   Klusterlet and the add-on agents alike.
 
@@ -395,13 +411,16 @@ must agree. The `csr` and `grpc` drivers agree to any cluster, because they chec
 it checks in its accept step instead:
 
 - When an agent creates its cluster, the hub records the agent's SPIFFE ID in the annotation
-  `open-cluster-management.io/spiffe-registered-by`, whatever the request says. Agents can't set
-  or change it.
+  `open-cluster-management.io/spiffe-registered-by`, whatever the request says. The admission
+  webhook guards it like the pin: only the hub gRPC server and users who may accept the cluster
+  can set or change it.
 - The `spiffe` driver agrees only if that ID matches an entry of `autoApprovedIdentities`. An entry
   is a SPIFFE ID in which `*` stands for one whole path segment. With no entry, a `spiffe` cluster
   is never accepted automatically, even with the feature gate on.
 - A cluster no `spiffe` agent registered, for example a `csr` cluster on a hub with both
-  drivers, isn't the `spiffe` driver's to decide: it agrees, and the other drivers decide.
+  drivers, isn't the `spiffe` driver's to decide: it agrees, and the other drivers decide. This is
+  no way around `autoApprovedIdentities`. Such a cluster has no pin, so the hub serves no SPIFFE
+  agent for it until an admin pins it.
 
 Example: with `spiffe://ocm-hub.example.org/ocm/cluster/*/agent/registration`, a cluster that
 cluster1's registration agent creates is accepted at once. A cluster registered by
@@ -623,19 +642,17 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   `spiffe://ocm-hub.example.org/ocm/cluster/cluster1/agent/work` becomes user
   `system:open-cluster-management:cluster1:work` with groups `system:open-cluster-management:cluster1`,
   `system:open-cluster-management:managed-clusters`, `system:open-cluster-management:spiffe-agents`
-  and `system:authenticated`. It rejects IDs from
-  another trust domain, or IDs that do not follow the scheme, such as `.../ocm/something-else`. It
-  also notes when the SVID expires.
+  and `system:authenticated`. It rejects IDs from another trust domain, or IDs that do not follow
+  the scheme, such as `.../ocm/something-else`. It also notes when the SVID expires.
+
+  Only this authenticator assigns `system:open-cluster-management:spiffe-agents`, and only to
+  Klusterlet agents. The pre-acceptance permission is bound to it, so that permission cannot be
+  used by an agent of another driver (see "Register").
 
   Every mapped identity gets `system:authenticated`, as the kube-apiserver gives every
   authenticated user today. The hub sends exactly these groups in its SubjectAccessReviews, so
   without it a permission bound to `system:authenticated`, which works for an agent today, would
   be denied after the switch to `spiffe`.
-
-  The registration, work and Klusterlet agents also get
-  `system:open-cluster-management:spiffe-agents`, the group the pre-acceptance ClusterRole is bound
-  to (see "Register"). No other driver gives it, so that role reaches only `spiffe` agents. Add-on
-  agents don't get it.
 - **Picking the right SVID** (`pkg/spiffe`). The
   Workload API can return several SVIDs for one pod, for example when the platform also gives
   every pod a generic identity, and `X509Source` uses the first one by default. Each OCM component
@@ -696,12 +713,13 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
     listener and its Secrets are removed.
 
   The server watches `ManagedCluster` and `ManagedClusterAddOn`. When a cluster is denied or
-  deleted, or an add-on is disabled, it closes the matching connections right away through the
-  connection registry described under sdk-go.
+  deleted, its trust-domain pin changes, or an add-on is disabled, it closes the matching
+  connections right away through the connection registry described under sdk-go.
 
   Two checks decide what a reconnecting agent of such a cluster may do. Before the
-  SubjectAccessReview, a gate on the listener refuses by identity: the trust domain must be the
-  one the cluster is pinned to; the registration and add-on agents of a cluster being deleted, the
+  SubjectAccessReview, a gate on the listener refuses by identity: an existing cluster must be
+  pinned, and the SVID's trust domain must be the one it is pinned to; the registration and add-on
+  agents of a cluster being deleted, the
   work and add-on agents of a denied cluster, and the agent of a disabled add-on are refused.
   Inside the SubjectAccessReview authorizer, once the request's data type is known, a second check
   (sdk-go `SARAuthorizer.WithSPIFFECheck`) allows a cluster being deleted only `ManifestWork`
@@ -837,6 +855,15 @@ a Workload API client there and acts as cluster1's work agent on the hub.
 namespaces only to cluster admins (see Operators). `nodes/proxy` reaches the kubelet directly and
 must be limited to cluster admins too. Anyone with node-level access can already act as any
 workload on that node.
+
+**Turning on the driver changes who can act for existing clusters.**
+Example: a hub with fifty `csr` clusters enables `spiffe` for one new cluster. Without care, SPIRE
+could then issue an ID for any of the fifty, and the fifty `csr` agents could use the permission
+meant for SPIFFE agents that are not accepted yet.
+*Mitigation:* the hub serves no SPIFFE agent for a cluster until an admin has pinned that cluster
+(see "Trust domains"), and the pre-acceptance permission is bound to a group that only the SPIFFE
+listener assigns (see "Register").
+
 **One trust domain acts for a cluster in another.**
 Example: `cluster2` is pinned to `east.example.org`, and the SPIRE servers of `west.example.org`
 issue `spiffe://west.example.org/ocm/cluster/cluster2/agent/work`, by mistake or because they are
@@ -949,10 +976,10 @@ All open questions are decided.
 3. **Should the `ManagedCluster` be created by the agent on first connection, or be pre-created
    by the admin with the agent only allowed to update its status?** Both. If the
    `ManagedCluster` does not exist, the registration agent creates it, pinned to its SVID's trust
-   domain. If an admin created it first, the agent uses it and only updates its status. A
-   pre-created cluster has no trust domain annotation: with one agent trust domain the hub pins it
-   to that one, and with several the admin sets `open-cluster-management.io/spiffe-trust-domain`
-   when creating it.
+   domain. If an admin created it first, the agent uses it and only updates its status. The hub
+   does not pin a pre-created cluster by itself: the admin sets
+   `open-cluster-management.io/spiffe-trust-domain` when creating it, or pins it with
+   `clusteradm accept --spiffe-trust-domain`.
 4. **Which SPIRE topology should `clusteradm` and the e2e tests treat as the reference?** One
    shared trust domain, with every cluster's SPIRE agents attesting to one SPIRE server. The
    `clusteradm` defaults, the documentation and the e2e tests are built around it: the agents'
@@ -998,7 +1025,13 @@ All open questions are decided.
   and one cluster migrates from one to the other. With the `ManagedClusterAutoApproval` feature
   gate on, check that a cluster registered by an auto-approved SPIFFE ID is accepted, that any
   other `spiffe` cluster waits for an admin, and that an agent can't set the
-  `spiffe-registered-by` annotation.
+  `spiffe-registered-by` annotation. Check that a cluster without a pin is refused until an admin
+  pins it, with one agent trust domain and with several, and that a cluster created outside the
+  SPIFFE listener and accepted automatically still serves no SPIFFE agent. Check that the
+  admission webhook lets only the hub gRPC server and users with `managedclusters/accept` set or
+  change the two annotations. With `spiffe` enabled next to `csr` and `grpc`, check that a `csr`
+  agent on the hub kube-apiserver and a `grpc` agent on its listener can still read only their
+  own `ManagedCluster` and create no other.
 - **API tests.** The `Klusterlet` CRD accepts `spiffe` with `deployOption.mode` empty, `Default`
   or `Singleton`, refuses it with `Hosted` and `SingletonHosted`, still accepts other drivers in
   the hosted modes, and refuses moving a `spiffe` Klusterlet to a hosted mode.
@@ -1033,8 +1066,11 @@ All open questions are decided.
   server under ocm), so agents that have not migrated keep their current endpoint and credentials.
 - Because the OCM user and group names are the same as with the `csr` and `grpc` drivers and the
   add-on framework defaults, an existing cluster keeps its ManagedCluster, namespace,
-  ManifestWorks, add-ons and RBAC when its Klusterlet switches to `spiffe`. Once the cluster is
-  accepted with the new identity, the registration agent deletes the old `hub-kubeconfig-secret`
+  ManifestWorks, add-ons and RBAC when its Klusterlet switches to `spiffe`. An admin first pins
+  the cluster to its trust domain, for example with
+  `clusteradm accept --clusters cluster1 --spiffe-trust-domain ocm-hub.example.org`; until then the
+  hub serves no SPIFFE agent for it. Once the registration agent is connected with its SVID, it
+  deletes the old `hub-kubeconfig-secret`
   and `bootstrap-hub-kubeconfig`, and, for each add-on, the `<addon>-hub-kubeconfig` Secret once
   it has written the add-on's `<addon>-spiffe` ConfigMap.
 - Before the switch, the platform checks the managed cluster's RBAC (see Operators). Add-ons keep
@@ -1077,6 +1113,8 @@ All open questions are decided.
 - 2026-11-20: Based the protection of agent identities on the managed cluster's RBAC, as with the
   existing drivers. The admission rules, the operator's webhook and the recovery steps are
   replaced by one policy that checks the role label, and moved to Alternatives.
+- 2026-11-20: Bound the pre-acceptance permission to a group of its own, and made the trust domain
+  pin an explicit admin step for every cluster a SPIFFE agent did not create.
 
 ## Drawbacks
 
