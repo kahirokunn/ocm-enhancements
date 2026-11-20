@@ -75,6 +75,10 @@ certificate authority.
 - `customSigner` add-on registrations. They exist to have the hub sign client certificates; in
   this mode an add-on that needs a client certificate uses its SVID instead.
 - JWT-SVID authentication (see [Alternatives](#alternatives)).
+- Protecting agent identities on a managed cluster whose RBAC lets other users run workloads, open
+  a shell or create ServiceAccount tokens in OCM's namespaces. As with the existing drivers, that
+  is the platform's responsibility. This proposal says what the RBAC must guarantee (see
+  [Operators](#operators)).
 - The `Hosted` and `SingletonHosted` install modes. There the agents run on a management cluster
   and need a credential for the managed cluster's kube-apiserver, which today is a kubeconfig in a
   Secret (`external-managed-kubeconfig`). That breaks the rule that OCM keeps no long-lived
@@ -342,19 +346,9 @@ spec:
         # Optional. Must equal the ClusterManager's templates.
         agentIDTemplate: "spiffe://{trustDomain}/ocm/cluster/{cluster}/agent/{role}"
         addOnAgentIDTemplate: "spiffe://{trustDomain}/ocm/cluster/{cluster}/addon/{addon}/agent/{agent}"
-        # Required: ValidatingAdmissionPolicy (Kubernetes 1.30 or later) or ValidatingWebhook.
-        # See "How the rules are enforced".
-        admissionEnforcement: ValidatingAdmissionPolicy
     addOnKubeClientRegistrationDriver:
       authType: spiffe       # required when registrationDriver.authType is spiffe
 ```
-
-**Admission enforcement.** `admissionEnforcement` says how the klusterlet operator enforces the
-admission rules that guard the agents' SVIDs (see Operators): `ValidatingAdmissionPolicy`, which
-needs Kubernetes 1.30 or later, or `ValidatingWebhook`, served by the operator, which works on
-every version. Both enforce the same rules. The field is required: the user chooses, and
-`ValidatingAdmissionPolicy` on an older cluster is refused as an unsupported Kubernetes version. A
-change moves the cluster from one to the other without a gap.
 
 **ID templates.** `agentIDTemplate` and `addOnAgentIDTemplate` set the layout of agent SPIFFE IDs,
 on the `ClusterManager` and on every `Klusterlet`, which must use the same templates. A template
@@ -428,20 +422,10 @@ reason `SPIFFEInstallModeNotSupported`. It does this before it looks for any man
 kubeconfig.
 
 The `Klusterlet` status gets one new field, `spiffe`, and one new condition,
-`SPIFFEAdmissionReady`, that tells the platform when it is safe to create the cluster's SPIRE
-entries (see "When the operator trusts the namespaces"). The field holds no key material:
-
-- `agentIDs`: the SPIFFE ID of each agent, rendered from the agent ID template. These are the IDs
-  the platform creates SPIRE entries for; `clusteradm join` prints them.
-- `admissionEnforcement`: the enforcement the operator has put in place and recorded.
-- `admissionPolicies`: with `ValidatingAdmissionPolicy`, for each of the three admission policies
-  (see Operators), the UID and generation of the policy and its binding that the operator has made
-  trusted.
-- `admissionWebhooks`: with `ValidatingWebhook`, the UID and generation of each of the three
-  ValidatingWebhookConfigurations instead.
-- `webhookSPIFFEID` and `webhookDNSName`: with `ValidatingWebhook`, the SPIFFE ID and DNS name the
-  operator's webhook SVID must have; the platform creates the operator's SPIRE entry from them.
-- `addOnNamespace`: the add-on namespace the operator created, by name and UID.
+`SPIFFEAgentRolePolicyApplied` (see [Operators](#operators)). The field holds no key material. Its
+`agentIDs` list has the SPIFFE ID of each agent, rendered from the agent ID template. These are
+the IDs the platform creates SPIRE entries for; `clusteradm join` prints them. The platform can
+create the entries before or after the join: an agent waits, not ready, until its SVID arrives.
 
 ```yaml
 status:
@@ -451,23 +435,8 @@ status:
       spiffeID: spiffe://ocm-hub.example.org/ocm/cluster/cluster1/agent/registration
     - role: work
       spiffeID: spiffe://ocm-hub.example.org/ocm/cluster/cluster1/agent/work
-    admissionEnforcement: ValidatingAdmissionPolicy
-    admissionPolicies:
-    - policyName: ocm-spiffe-agents-klusterlet
-      policyUID: 6f1c2d0e-0b5e-4c4f-9a57-3d1f0c8e2a11
-      policyGeneration: 3
-      bindingUID: 9a2e7b44-5c1d-4e0a-8f3b-2c6d9e1f7a05
-      bindingGeneration: 1
-    - policyName: ocm-spiffe-addons-klusterlet
-      # ...
-    - policyName: ocm-spiffe-addon-namespace-label
-      # ...
-    # The add-on namespace the operator created; see "Which namespaces recovery cleans".
-    addOnNamespace:
-      name: open-cluster-management-agent-addon
-      uid: 3b8d5f21-7e4a-4c19-b6d2-8a0f1e9c4d73
   conditions:
-  - type: SPIFFEAdmissionReady
+  - type: SPIFFEAgentRolePolicyApplied
     status: "True"
 ```
 
@@ -521,339 +490,129 @@ spec:
   - "k8s:sa:klusterlet-work-sa"   # SPIRE also checks the pod's ServiceAccount
 ```
 
-**Who may start pods in the agent namespaces.** Selecting on namespace, ServiceAccount and label
-only helps if nobody else can start a pod with that combination. Restricting Pod creation alone is
-not enough: anyone who can create a Deployment, ReplicaSet, StatefulSet, DaemonSet, Job or
-CronJob in the namespace can put the agent's ServiceAccount and `spiffe-role` label in the pod
-template, and a Kubernetes controller then creates the Pod for them. For example, a user allowed
-to create Jobs in `open-cluster-management-agent` could run a Job as `klusterlet-work-sa` with
-`spiffe-role: work` and receive cluster1's work-agent SVID.
+**Who can get an agent's SVID.** SPIRE gives an SVID to any pod that matches an entry's selectors.
+It does not look at who created the pod, or at what the pod runs. So these are the people and
+components that can act as a cluster's agents:
 
-So in `spiffe` mode the Klusterlet operator enforces three sets of admission rules, written as
-ValidatingAdmissionPolicies, each with its binding. The operator's webhook can enforce the same
-rules instead, on any Kubernetes version (see "How the rules are enforced"):
+- Cluster admins of the managed cluster, and anyone with access to its nodes.
+- Anyone who can, in one of OCM's namespaces, start a pod with an agent's ServiceAccount, get into
+  an agent pod, or act as one of OCM's ServiceAccounts. OCM's namespaces are the operator
+  namespace, the agent namespace and the add-on install namespaces.
+- Hub users who can create `ManifestWork`s for the cluster that run with the work agent's own
+  permissions (the default executor). The work agent applies their manifests, and it is `admin`
+  in every namespace of the managed cluster, the agent namespace included.
+- The platform that writes the SPIRE registration entries.
 
-| Policy | Covers |
-| --- | --- |
-| `ocm-spiffe-agents-<klusterlet>` | The agent namespace, `open-cluster-management-agent`. The rules below. |
-| `ocm-spiffe-addons-<klusterlet>` | This Klusterlet's dedicated add-on namespaces (see "Add-on namespaces must be dedicated"). |
-| `ocm-spiffe-addon-namespace-label` | Namespace requests, cluster-wide: who may set the add-on namespace label. Shared by every `spiffe` Klusterlet on the cluster, and removed with the last one. |
+Apart from the last one, the existing drivers trust the same set: there, the same people can read
+the `hub-kubeconfig-secret`, or start a pod that mounts it. What changes is what they get. With
+`spiffe` it is a short-lived SVID that stays in memory, one hour with SPIRE's default TTL, not a
+key and certificate in a Secret that stay valid until the certificate expires.
 
-In the agent namespace:
+**What the managed cluster's RBAC must guarantee.** OCM relies on the managed cluster's RBAC to
+keep everyone else out, as the existing drivers do. In the operator namespace, the agent namespace
+and every add-on install namespace, only cluster admins, Kubernetes' built-in controllers, and the
+ServiceAccounts of OCM and of the add-ons themselves may:
 
-- Deployments may be created, or have their spec changed, only by the Klusterlet operator's
-  ServiceAccount. Updates that leave the spec unchanged are allowed, because the Deployment
-  controller and the garbage collector change Deployments' metadata during rollouts and deletion.
-- ReplicaSets may be created only by the Deployment controller, with a Deployment as owner, and
-  Pods only by the ReplicaSet controller, with a ReplicaSet as owner. So every Pod traces back to
-  a Deployment, and only the operator can create Deployments.
-- After creation, a ReplicaSet's spec may be changed only by the Deployment controller, and its
-  Pod template not at all. The Deployment controller only scales ReplicaSets; for a new template
-  it creates a new ReplicaSet. Without this, someone allowed to update ReplicaSets could change
-  the image, and the ReplicaSet controller would create Pods from it that pass every other check.
-- After creation, nobody may change a Pod's container images or add ephemeral containers (the
-  `pods/ephemeralcontainers` subresource). Kubernetes allows image updates on a running Pod, so
-  without this a user could swap the code inside an agent Pod that already holds an SVID. Status
-  updates, and the label and annotation changes controllers make, are still allowed.
-- Nobody may open `pods/exec` or `pods/attach` on a Pod (the `CONNECT` operation on those
-  subresources). A process started that way runs inside the agent's container, can reach the
-  Workload API socket, and gets the agent's SVID, because SPIRE attests the pod, not the process.
-  The image and ephemeral-container rules do not cover this. `pods/log` is still allowed, so
-  agents can be debugged from their logs. A cluster-admin who needs a shell has to remove the
-  binding, which starts the recovery below.
-- StatefulSets, DaemonSets, Jobs and CronJobs are refused.
-- A Pod's `spiffe-role` label must match its ServiceAccount, and neither may change after
-  creation. These are the only allowed pairs, for a Klusterlet named `<klusterlet>`:
+- create or change Pods, Deployments, ReplicaSets, StatefulSets, DaemonSets, Jobs and CronJobs;
+- use `pods/exec`, `pods/attach` or `pods/ephemeralcontainers`. A process started that way runs
+  inside the agent's pod and gets the agent's SVID, because SPIRE attests the pod, not the process;
+- create ServiceAccount tokens (`serviceaccounts/token`), impersonate ServiceAccounts, or read or
+  create Secrets. A Secret of type `kubernetes.io/service-account-token` gets a long-lived token
+  for the ServiceAccount it names.
 
-  | Install mode | `spiffe-role` | ServiceAccount |
-  | --- | --- | --- |
-  | `Default` | `registration` | `<klusterlet>-registration-sa` |
-  | `Default` | `work` | `<klusterlet>-work-sa` |
-  | `Singleton` | `klusterlet` | `<klusterlet>-work-sa` |
+The built-in `edit` and `admin` ClusterRoles include all of these except
+`pods/ephemeralcontainers`, so they must not be bound in those namespaces, neither by a
+RoleBinding there nor by a ClusterRoleBinding. `nodes/proxy` reaches the kubelet directly and must
+be limited to cluster admins.
 
-  The singleton agent reuses `<klusterlet>-work-sa`, so the label is what tells it apart from a
-  work agent. A pod with `<klusterlet>-work-sa` and any other role label is refused.
+Example: a user who may create a token for `klusterlet-work-sa` can act as the work agent. The work
+agent is `admin` in every namespace, so that user can then start any pod in the agent namespace
+and get an agent's SVID.
 
-**How admission checks the chain.** A ValidatingAdmissionPolicy only sees the request in front
-of it: the user making it and the object. When the ReplicaSet controller creates a Pod, the policy
-sees that controller, not whoever created the Deployment, and it cannot look that up. So the
-creator is checked once, at the top of the chain: when a Deployment (or, in add-on namespaces, a
-DaemonSet or StatefulSet) is created or changed, the request comes from the real user, and the
-policy allows only the operator or the work agent. Every step below that is checked by who makes
-the request and the owner kind: a ReplicaSet must come from the Deployment controller
-(`system:serviceaccount:kube-system:deployment-controller`) and be owned by a Deployment, and a
-Pod must come from the matching built-in controller and be owned by a ReplicaSet, DaemonSet or
-StatefulSet. While the policy is in place, nobody else can create the top object, so every pod
-traces back to the operator or the work agent. Workloads created before the policy existed, or
-while it was missing or changed, skip that first check; the operator removes them before it
-relies on the policy (see "When the operator trusts the namespaces").
+**OCM creates only its own RBAC.** The Helm chart, which `clusteradm join` uses too, installs the
+operator's ServiceAccount and ClusterRole. The operator then creates the agents' ServiceAccounts,
+Roles and bindings when it reconciles the `Klusterlet`. Nothing OCM installs gives anyone else
+access to these namespaces. OCM cannot make sure that nobody else has it, though. RBAC only adds
+permissions: a binding the platform created, such as `edit` for a team in every namespace, covers
+OCM's namespaces too, and OCM cannot take it away. The platform checks it, for example:
 
-This needs each built-in controller to run under its own ServiceAccount, which is what
-kube-controller-manager's `--use-service-account-credentials=true` does. kubeadm sets it by
-default; on managed services the platform must confirm it. If the controllers share one identity
-instead, the policy refuses their ReplicaSets and Pods, so no agent starts; the refusal shows in
-the Deployments' and ReplicaSets' conditions and events. The operator does not detect this case
-itself. That is safe, but unsupported: `spiffe` mode requires separate controller
-ServiceAccounts.
+```shell
+# Who is bound in the namespace, and who is bound in every namespace.
+kubectl get rolebindings -n open-cluster-management-agent -o wide
+kubectl get clusterrolebindings -o wide
 
-Namespace RBAC that grants these permissions only to the operator is the first layer; the policy
-holds even if RBAC is later widened by mistake. RBAC must also grant `pods/exec` and `pods/attach`
-in the agent namespaces only to cluster admins. The built-in `admin` and `edit` ClusterRoles
-include both, so they must not be bound there. One path goes around both layers: `nodes/proxy`
-reaches the kubelet directly, and the API server checks such a request against the node, not the
-pod, so the policy never sees it. Access to `nodes/proxy` is node-level access and must be limited
-to cluster admins (see Risks).
+# Each must answer "no" for every user and ServiceAccount that is not a cluster admin
+# or one of OCM's own ServiceAccounts.
+kubectl auth can-i create pods -n open-cluster-management-agent --as <user>
+kubectl auth can-i create pods/exec -n open-cluster-management-agent --as <user>
+kubectl auth can-i create serviceaccounts/token -n open-cluster-management-agent --as <user>
+```
 
-Add-on agent namespaces get the same rules, in their own policy, with three differences:
+**The one check RBAC cannot express.** RBAC decides who may create a Pod. It cannot say how the
+Pod's fields must relate. SPIRE tells the singleton agent and the work agent apart by the role
+label alone, so the label must always match the ServiceAccount. In `spiffe` mode the klusterlet
+operator installs one ValidatingAdmissionPolicy and its binding,
+`ocm-spiffe-agent-roles-<klusterlet>`, for the agent namespace. A Pod that uses one of this
+Klusterlet's agent ServiceAccounts must carry the matching `spiffe-role` label, and the label may
+not change afterwards. These are the pairs for a Klusterlet named `<klusterlet>`:
 
-- The allowed creator of Deployments is the work agent, which applies the add-on's manifests from
-  the hub. So every add-on pod traces back to a manifest the hub defined.
-- Add-ons may also use DaemonSets and StatefulSets, because many add-ons run one pod per node or
-  need stable storage. The same chain applies: only the work agent may create them or change their
-  spec, and a Pod is admitted only when the DaemonSet or StatefulSet controller created it for one
-  the work agent created. Jobs and CronJobs stay refused: a Job's pods are short-lived and a
-  CronJob keeps creating new ones, which makes the chain harder to check, and add-on agents are
-  long-running.
-- The table above does not apply. Add-on pods use their own ServiceAccounts and the role label
-  value `addon`. The policy refuses, in an add-on namespace, any pod with a Klusterlet
-  ServiceAccount or with the role `registration`, `work` or `klusterlet`. Example: the agent of
-  `my-addon` runs as `my-addon-agent-sa` with `spiffe-role: addon` and is admitted; a pod in the
-  same namespace with `klusterlet-work-sa` is refused. The add-on's SPIRE entry selects on its
-  namespace, its ServiceAccount and `spiffe-role: addon`.
+| Install mode | ServiceAccount | `spiffe-role` |
+| --- | --- | --- |
+| `Default` | `<klusterlet>-registration-sa` | `registration` |
+| `Default` | `<klusterlet>-work-sa` | `work` |
+| `Singleton` | `<klusterlet>-work-sa` | `klusterlet` |
 
-**Add-on namespaces must be dedicated to add-on agents.** An add-on can be installed into any
-namespace, including one shared with unrelated applications, such as `default`. The policy would
-then block those applications' Deployments, and the recovery below would delete them. So in
-`spiffe` mode the add-on policy and the recovery cover only namespaces labeled
-`open-cluster-management.io/spiffe-addon-namespace: <klusterlet>`, and an add-on agent gets an
-SVID only in such a namespace. The label's value names the Klusterlet the namespace belongs to.
-That matters when one cluster runs several Klusterlets, for example to join several hubs, and
-each has its own add-on namespaces:
+Example: in `Default` mode, a Pod with `klusterlet-work-sa` and `spiffe-role: klusterlet` is
+refused.
 
-- The label can be set only when the namespace is created, by the Klusterlet's work agent
-  (applying the add-on's namespace manifest) or by the Klusterlet operator. Nobody may add it to
-  or change it on an existing namespace, and only the operator may remove it. The policy enforces
-  these rules on Namespace requests. There are no exceptions: the operator never labels an
-  existing namespace, because anything could be created in it between a check and the label.
-- In a namespace labeled for Klusterlet `cluster4`, only `cluster4`'s work agent may create
-  Deployments, DaemonSets and StatefulSets or change their spec. Another Klusterlet's work agent
-  is refused, so it cannot put pods into `cluster4`'s namespaces, even while `cluster4` is
-  recovering.
-- That includes the operator's own `open-cluster-management-agent-addon`. If it already exists
-  without the label, for example from an earlier mode, it is treated like any shared namespace:
-  the operator leaves it untouched, the Klusterlet reports it in a condition, and add-ons there get
-  `AddOnNamespaceNotDedicated`. The admin moves out anything that is not an add-on and deletes the
-  namespace. The operator then creates it again with the label, and the work agent re-applies the
-  add-ons into it. Example: someone ran their own `nginx` Deployment in
-  `open-cluster-management-agent-addon`; the admin moves `nginx` elsewhere and deletes the
-  namespace, and the add-ons come back in the new, labeled one.
-- **Which namespaces recovery cleans.** The label alone is not enough, because it could be added
-  or changed while the policy is missing. Example: during a gap, someone adds
-  `spiffe-addon-namespace: cluster4` to `default`. So recovery cleans an add-on namespace only if
-  its UID shows it really belongs to this Klusterlet: it is listed in one of the Klusterlet's
-  `AppliedManifestWork`s, which means its work agent created it, or it is the
-  `open-cluster-management-agent-addon` the operator created, whose UID the operator records in
-  the Klusterlet status. Users who can edit namespaces cannot change either record. Any other
-  namespace that carries this Klusterlet's label is not cleaned; the operator removes the label,
-  so SPIRE issues no add-on SVID there, and add-ons in it get `AddOnNamespaceNotDedicated`.
-  In the example, nothing in `default` is deleted and the label is simply removed again.
-- The add-on framework adds the label to the namespace manifest it renders for the add-on.
-- If an add-on's install namespace already exists without the label, for example `default`, the
-  work agent cannot label it, and the registration agent sets `RegistrationApplied=False` on the
-  `ManagedClusterAddOn` with reason `AddOnNamespaceNotDedicated`. The add-on has to be moved to a
-  namespace of its own. Nothing in `default` is blocked or deleted.
-- The add-on's SPIRE entry also selects on the label, so SPIRE issues no add-on SVID in an
-  unlabeled namespace, even one with the right name:
+- The policy looks only at the Pod, never at who creates it. It is not a security boundary:
+  whoever may create Pods in the agent namespace is trusted already. It makes a wrong label fail
+  when the Pod is created, not later as an SVID that never arrives.
+- It checks only Pods that use this Klusterlet's ServiceAccounts. Pods of another Klusterlet, or of
+  an add-on, in the same namespace are not refused.
+- ValidatingAdmissionPolicy is GA from Kubernetes 1.30. On an older cluster the operator installs
+  nothing and sets the Klusterlet condition `SPIFFEAgentRolePolicyApplied` to `False` with reason
+  `NotServed`. It deploys the agents all the same.
+- The permission to manage the policy and its binding is in a separate ClusterRole,
+  `klusterlet-spiffe`, installed only where it is used. The Helm chart renders it when
+  `klusterlet.registrationConfiguration` uses `spiffe`, or with the value `enableSPIFFE: true` for
+  a `spiffe` Klusterlet created outside the chart; `clusteradm join` uses the chart. With
+  kustomize, `deploy/klusterlet/spiffe` is the default install plus this ClusterRole. The OLM
+  bundle does not include it. Without it the operator sets `SPIFFEAgentRolePolicyApplied` to
+  `False` with reason `PermissionsMissing`, and deploys the agents all the same.
+- An operator with no `spiffe` Klusterlet never looks up, lists or watches the admission APIs, and
+  needs no permission on them, on any Kubernetes version.
 
-  ```yaml
+**Add-on agents.** Add-on pods use their own ServiceAccounts and the role label value `addon`,
+which the add-on framework sets. An add-on's SPIRE entry selects on its install namespace, its
+ServiceAccount and that label. For example, for the agent of `my-addon` on `cluster1`:
+
+```yaml
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: ocm-cluster1-my-addon
+spec:
+  spiffeIDTemplate: "spiffe://ocm-hub.example.org/ocm/cluster/cluster1/addon/my-addon/agent/my-addon-agent"
   namespaceSelector:
     matchLabels:
       kubernetes.io/metadata.name: open-cluster-management-agent-addon
-      open-cluster-management.io/spiffe-addon-namespace: klusterlet
-  ```
-
-**How the rules are enforced.** ValidatingAdmissionPolicy is GA from Kubernetes 1.30. On every
-reconcile, the klusterlet operator checks whether the `admissionregistration.k8s.io/v1`
-ValidatingAdmissionPolicy API is served, and enforces the rules in one of two ways:
-
-| `admissionEnforcement` | Kubernetes | How |
-| --- | --- | --- |
-| `ValidatingAdmissionPolicy` | 1.30 or later | The operator installs the three policies and bindings; the API server evaluates them. |
-| `ValidatingWebhook` | every version | The operator installs three ValidatingWebhookConfigurations that send the same requests to its own webhook, which evaluates the same policies' CEL rules with the same variables (`object`, `oldObject`, `request`, `variables`). |
-
-The field is required; there is no default. `ValidatingAdmissionPolicy` on a cluster that doesn't
-serve the API is refused as an unsupported Kubernetes version: the operator logs an error, deploys
-no agent, sets `Applied=False` with reason `UnsupportedKubernetesVersion` and a message naming the
-cluster's version, and leaves any enforcement already in place:
-
-```text
-unsupported Kubernetes version v1.29.14: admissionEnforcement ValidatingAdmissionPolicy needs
-Kubernetes 1.30 or later, which serves the admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy
-API; use ValidatingWebhook on this cluster
+  podSelector:
+    matchLabels:
+      open-cluster-management.io/spiffe-role: addon
+  workloadSelectorTemplates:
+  - "k8s:sa:my-addon-agent-sa"
 ```
 
-`clusteradm join` checks the same before it applies anything. A Klusterlet without the field,
-possible only under an older CRD, gets `Applied=False` with reason `InvalidSPIFFEConfiguration`.
+An add-on can be installed in any namespace, and nothing in this driver blocks or deletes other
+workloads there. The RBAC requirement above holds for that namespace too. In a namespace shared
+with other applications, whoever can start pods there can get the add-on's SVID, as they can read
+the add-on's hub kubeconfig Secret today. An add-on that has to be kept apart needs a namespace of
+its own.
 
-The webhook:
-
-- **Serves with an SVID, not a stored certificate.** The operator gets its own X.509-SVID from the
-  local SPIRE agent, in memory, and rotates it with SPIRE. Its SPIFFE ID is the agent template
-  rendered with the role `operator`, for example
-  `spiffe://ocm-hub.example.org/ocm/cluster/cluster1/agent/operator`. The hub accepts no agent with
-  that role, so the SVID can't act on the hub. It must carry the DNS name of the webhook Service,
-  `klusterlet-spiffe-webhook.<operator namespace>.svc`. The operator writes the trust bundle of the
-  SVID's trust domain, public CA certificates only, into each configuration's `caBundle`, and
-  updates it when SPIRE's CA rotates. No Secret is created.
-- **Needs one more SPIRE entry, created before join:** for the operator's pods (namespace
-  `open-cluster-management`, ServiceAccount `klusterlet`, label `app: klusterlet`), with that ID
-  and DNS name. Creating it early is safe: only the operator's own pods get it, and the operator's
-  ServiceAccount can already do everything the SVID allows. Until the operator has the SVID,
-  `SPIFFEAdmissionReady` is `False` with reason `WebhookNotReady`, and its message names the entry.
-
-  ```yaml
-  apiVersion: spire.spiffe.io/v1alpha1
-  kind: ClusterSPIFFEID
-  metadata:
-    name: ocm-klusterlet-operator
-  spec:
-    spiffeIDTemplate: "spiffe://{{ .TrustDomain }}/ocm/cluster/cluster1/agent/operator"
-    dnsNameTemplates: ["klusterlet-spiffe-webhook.open-cluster-management.svc"]
-    namespaceSelector:
-      matchLabels: {kubernetes.io/metadata.name: open-cluster-management}
-    podSelector:
-      matchLabels: {app: klusterlet}
-    workloadSelectorTemplates: ["k8s:sa:klusterlet"]
-  ```
-- **Fails closed.** The configurations use `failurePolicy: Fail`, so a request the webhook can't
-  answer is refused. While the operator is down, no agent or add-on pod can be created, for
-  example after a node failure; running pods are not affected. The namespace label webhook sees
-  only namespaces that have or had the add-on namespace label (`objectSelector`), so a webhook
-  that is down never blocks other namespaces.
-
-**Switching between the two.** When the wanted enforcement differs from the recorded one, and the
-recorded one is still intact, the operator puts the new one in place, records it with
-`SPIFFEAdmissionReady=True` and reason `Switched`, and removes the old one in the next pass. The API
-server starts enforcing new policies or webhook configurations a moment after they are created, so
-the operator records the new one only once a dry-run request shows the API server enforces it:
-
-- To `ValidatingAdmissionPolicy`: a Job in the agent namespace, which the policy refuses to
-  everyone. The API server runs the policies before any webhook, so a refusal that names the
-  Klusterlet's policy shows the policy is in effect even while the webhook is still there.
-- To `ValidatingWebhook`: a Deployment from the operator in the agent namespace, which both allow.
-  The old policy would refuse a Job before the webhook is called, so instead the webhook notes the
-  request when the API server sends it.
-
-The rules are enforced throughout, so no recovery runs and the agents keep running. If the recorded
-enforcement was tampered with, or can't be checked, recovery runs instead. A cluster upgraded to
-1.30 keeps the webhook until the user changes `admissionEnforcement`.
-
-The operator installs the policies, bindings or webhook configurations itself, so on every
-reconcile it also recreates them if they are missing. If they are removed or changed, it runs the
-recovery steps below before any agent comes back, with `SPIFFEAdmissionReady=False` and reason
-`Recovering` until it finishes.
-
-**Only `spiffe` Klusterlets use the admission APIs.** An operator with no `spiffe` Klusterlet never
-looks up, lists or watches the admission APIs, and needs no permission on them, on any Kubernetes
-version. The permissions of the `spiffe` driver, on the admission policies, bindings and webhook
-configurations, for cleaning the agent and add-on namespaces during recovery and for the dry-run
-Job of a switch, are in a separate
-ClusterRole, `klusterlet-spiffe`, installed only where it is used, together with the webhook
-Service and, on the operator, the SPIFFE CSI volume and the webhook port:
-
-- The Helm chart renders it when `klusterlet.registrationConfiguration` uses `spiffe`, or with the
-  value `enableSPIFFE: true` for a `spiffe` Klusterlet created outside the chart. `clusteradm join`
-  uses the chart, so it installs the ClusterRole with a `spiffe` Klusterlet.
-- With kustomize, `deploy/klusterlet/spiffe` is the default install plus these.
-- The OLM bundle does not include it; OLM users who need `spiffe` apply it themselves.
-
-The first time the operator reconciles a `spiffe` Klusterlet, it checks with
-SelfSubjectAccessReviews that it has every permission of `klusterlet-spiffe`. If one is missing, it
-deploys no agent and sets `Applied=False` with reason `SPIFFEPermissionsMissing`, naming the
-ClusterRole and the missing permissions. Otherwise it starts watching the webhook configurations,
-and the policies and bindings where they are served, so that a change to one runs recovery at once
-rather than at the next resync.
-
-**When the operator trusts the namespaces.** The checks above prove where a pod came from only if
-the policy was in place when its top-level workload was created. That is not true for workloads
-created before the policy first existed, or while it was missing or changed. Looking at the
-policy alone does not show this: if the policy is removed and recreated, or edited and put back,
-while the operator is down, it looks unchanged when the operator starts. So the operator records
-which policy it trusts. After it finishes the recovery steps below, it saves the `metadata.uid`
-and `metadata.generation` of the policies and bindings in `status.spiffe.admissionPolicies` on the
-Klusterlet (see API). On every reconcile, including the first after the operator starts and after
-a watch is re-established, it compares them with the live objects. With `ValidatingWebhook`, it
-records and compares the webhook configurations the same way, in `status.spiffe.admissionWebhooks`.
-If nothing is recorded, or any value differs, it runs recovery before any agent runs. This covers:
-
-- **First activation.** A new Klusterlet in `spiffe` mode, or an existing one switched to it, has
-  nothing recorded. The operator runs recovery once, which removes any workload created before the
-  policy existed. Example: a Deployment someone created in `open-cluster-management-agent` with
-  `klusterlet-work-sa` and `spiffe-role: work` before the switch is deleted before the work agent
-  starts.
-- **Policy or binding recreated.** The new objects have new UIDs.
-- **Policy or binding edited**, for example weakened and then put back. Every spec change raises
-  the generation.
-
-Recovery removes an old workload, but if SPIRE entries for the cluster already exist, a pod from
-that workload could get an SVID before recovery deletes it. OCM does not manage SPIRE entries, so
-it cannot hold them back itself. Instead the Klusterlet gets a condition, `SPIFFEAdmissionReady`,
-which turns `True` only once the first recovery has finished and the values are recorded. The
-platform creates the cluster's SPIRE entries only after that, and `clusteradm join` waits for it
-and says so. With that order, nothing can get an agent SVID before the
-namespaces are clean. If entries already exist, for example when a cluster switches from another
-mode and the platform created them early, the same gap as below applies: a pod that got an SVID
-before the cleanup can use it until it expires. For a new cluster that pod can do little, because
-the hub does not accept the cluster until an admin does.
-
-When the operator changes the policy itself, for example after an operator upgrade, it records the
-new generation in the same reconcile without running recovery, but only if the values before its
-change matched the recorded ones. It also remembers, in memory, each generation change its own
-updates made, so a later pass doesn't take them for tampering: one Klusterlet's pass updating the
-namespace label objects all its Klusterlets share, or a CA bundle update that reached only some of
-the webhook configurations before it failed. After a restart it remembers none, and such a
-difference runs recovery. Changing the Klusterlet status needs write access to the
-`klusterlets/status` subresource, which only cluster-admin and the operator have.
-
-**Accepted gap when the policy is removed.** Scaling to zero stops the real agents, but it does
-not close every hole. The policy and its binding are cluster-scoped, so only cluster-admin (and
-the operator) can delete them. If a cluster-admin deletes them *and* namespace RBAC also lets
-someone else create workloads in an agent namespace, that user can start a pod with the agent's
-ServiceAccount and role label before the operator reacts, and SPIRE gives it an SVID. This needs
-two mistakes at once.
-
-Recovery runs in the operator, in this order:
-
-1. Recreate the three policies and bindings, and note their UIDs and generations. Set
-   `SPIFFEAdmissionReady=False` with reason `Recovering`.
-2. Remove this Klusterlet's label from any namespace whose UID is not on record (see "Which
-   namespaces recovery cleans").
-3. Delete every Deployment, DaemonSet, StatefulSet, ReplicaSet, Job, CronJob and Pod in this
-   Klusterlet's agent namespace and in its recorded add-on namespaces, trusted or not. That
-   includes the operator's own agent Deployments, so the agents stop too, and with the work agent
-   stopped nothing re-applies add-on workloads during the cleanup. Someone with widened RBAC could
-   have created new workloads or changed existing ones, and the operator cannot tell a changed
-   workload from a clean one, so it removes them all. Because add-on namespaces are dedicated and
-   checked by UID, this never touches unrelated applications or another Klusterlet's add-ons on
-   the same cluster. The operator checks again every few seconds until no Pod is left.
-4. Compare the policies and bindings with the values noted in step 1. If anything changed, someone
-   may have weakened a policy during the cleanup and put it back, so the operator starts again
-   from step 1. Otherwise it records the values in the Klusterlet status and sets
-   `SPIFFEAdmissionReady=True`. It starts the agents in the next reconcile, once the record is
-   stored, so a status write that conflicts cannot leave agents running without a record. The
-   work agent then re-applies the add-on workloads from their `ManifestWork`s, so every add-on
-   workload, DaemonSets included, comes back as a clean copy of what the hub defined, and passes
-   the restored policies.
-
-The restored policy alone cannot refuse new pods from a workload created during the gap, because
-those pods come from the normal built-in controller (see "How admission checks the chain"). So
-the gap lasts until step 3 finishes, not just until the policy is back. The operator watches the
-policy and binding and runs these steps in one reconcile, so the gap is normally short. If step 1
-fails, for example because something keeps deleting the policy, no agent runs, the gap stays open
-and `SPIFFEAdmissionReady` stays `False`. Add-ons are briefly down during recovery. A pod
-that got an SVID during the gap can still use it until it expires, and the hub can stop it sooner
-only by denying or deleting the cluster. We accept this
-rather than tying SPIRE entries to the policy, because OCM does not manage SPIRE entries.
+Every add-on workload is applied by the work agent from a `ManifestWork`, so whoever writes one
+add-on's manifests can also use another add-on's ServiceAccount in the same namespace. Add-on
+managers are trusted for the clusters they manage, as today.
 
 #### sdk-go
 
@@ -1002,11 +761,9 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   a ConfigMap, `<addon>-spiffe`, in the add-on's install namespace, with the settings the add-on
   agent needs and nothing secret: `hub-endpoint`, `hub-spiffe-id`, `agent-spiffe-id` (rendered
   from the add-on agent ID template) and `workload-api-socket`. It deletes the ConfigMap when the
-  registration goes away. The registration agent sets `RegistrationApplied=False` with reason
-  `AddOnNamespaceNotDedicated` when an add-on's install namespace lacks the
-  `spiffe-addon-namespace` label.
-- **Klusterlet operator.** Record the trusted policy and binding in the Klusterlet status, and run
-  recovery when they are missing or differ (see "When the operator trusts the namespaces").
+  registration goes away.
+- **Klusterlet operator.** Install the agent role policy and its binding where the API is served,
+  and report it in the `SPIFFEAgentRolePolicyApplied` condition (see Operators).
 
 #### addon-framework
 
@@ -1018,15 +775,12 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   same volume name and mount path; every container, init containers too, mounts the
   `csi.spiffe.io` volume; and the pod gets the `spiffe-role: addon` label.
   Unit tests cover all three kinds, typed and unstructured.
-- The add-on's namespace manifest gets the `open-cluster-management.io/spiffe-addon-namespace`
-  label, set to the Klusterlet's name, so the namespace is dedicated from the moment it is created
-  (see Operators). The framework learns the Klusterlet's name from the `ManagedCluster`
-  annotation `agent.open-cluster-management.io/klusterlet-name`, which the registration agent of
-  a `spiffe` Klusterlet sets when it creates or updates the cluster.
-- On such a cluster, the framework renders an add-on only after the registration agent has
-  reported the add-on's `kubeClient` driver in `status.registrations`. Rendered earlier, the
-  add-on would mount a hub kubeconfig Secret that is never created, and its namespace would be
-  created without the label, which can't be added later.
+- The framework knows that a cluster's add-ons use `spiffe` from the `ManagedCluster` annotation
+  `agent.open-cluster-management.io/klusterlet-name`, which the registration agent of a `spiffe`
+  Klusterlet sets when it creates or updates the cluster. On such a cluster, the framework renders
+  an add-on only after the registration agent has reported the add-on's `kubeClient` driver in
+  `status.registrations`. Rendered earlier, the add-on would mount a hub kubeconfig Secret that is
+  never created.
 - `pkg/spiffeclient` is the client helper: it reads the `<addon>-spiffe` settings from the mounted
   directory, opens the Workload API and builds the gRPC options.
 - An example add-on, `helloworld-spiffe`, shows a manager and an agent written for the driver.
@@ -1040,16 +794,12 @@ clusteradm init --registration-drivers spiffe --spiffe-trust-domain ocm-hub.exam
 
 # Managed cluster: no token. Add --singleton for the Singleton mode (--mode hosted is
 # refused with spiffe), and --spiffe-trust-domain when the agents' trust domain isn't the
-# hub's. join installs the klusterlet-spiffe ClusterRole with the operator, waits for
-# SPIFFEAdmissionReady and prints the agents' SPIFFE IDs (status.spiffe.agentIDs), for which
-# the platform then creates the SPIRE entries. --spiffe-admission-enforcement is required:
-# ValidatingAdmissionPolicy (Kubernetes 1.30 or later, checked before anything is applied) or
-# ValidatingWebhook. With the webhook, the operator's own SPIRE entry comes first; while join
-# waits, it says which.
+# hub's. join installs the klusterlet-spiffe ClusterRole with the operator and prints the
+# agents' SPIFFE IDs (status.spiffe.agentIDs), for which the platform creates the SPIRE
+# entries, before or after the join.
 clusteradm join --cluster-name cluster1 --registration-auth spiffe \
   --hub-grpc-endpoint ocm-grpc.hub.internal:443 \
-  --hub-spiffe-id spiffe://ocm-hub.example.org/ocm/hub/grpc-server \
-  --spiffe-admission-enforcement ValidatingAdmissionPolicy
+  --hub-spiffe-id spiffe://ocm-hub.example.org/ocm/hub/grpc-server
 
 # Unchanged. accept --spiffe-trust-domain pins a cluster that isn't pinned yet and has no pending
 # CSR; a csr cluster is accepted as before, by approving its CSR.
@@ -1063,41 +813,30 @@ clusteradm addon enable --names my-addon --clusters cluster1
 If SPIRE issues `.../ocm/cluster/cluster1/...` to a pod that is not one of cluster1's agents,
 that pod can act as cluster1. Example: a careless registration entry that matches any pod with the
 `work` label on any cluster.
-*Mitigation:* the platform must tie each cluster's entries to that cluster's SPIRE agents, and select
-on namespace, ServiceAccount and role label (see Operators). The admission policy the Klusterlet
-operator installs makes sure only operator-owned Deployments can start pods with that combination,
-so a user who can create a Job or Deployment in the agent namespace cannot borrow the agent's
-identity. The hub also checks that every request is about the cluster named in the SVID, so an
-agent of cluster2 can never change cluster1's resources, even with a valid SVID. This is
-documented as a deployment requirement.
+*Mitigation:* the platform must tie each cluster's entries to that cluster's SPIRE agents, and
+select on namespace, ServiceAccount and role label (see Operators). The hub also checks that every
+request is about the cluster named in the SVID, so an agent of cluster2 can never change
+cluster1's resources, even with a valid SVID. This is documented as a deployment requirement.
 
-**The operator's webhook is down.**
-With `ValidatingWebhook` enforcement, the API server asks the operator about every agent and add-on
-pod. While the operator is down, for example during an upgrade or after a node failure, or while
-SPIRE can't renew its SVID, no such pod can be created.
-*Mitigation:* the webhook fails closed, so the rules are never skipped. Running pods are not
-affected, and the operator's own pods are outside the rules. The namespace label webhook sees only
-labeled namespaces. On Kubernetes 1.30 or later, `ValidatingAdmissionPolicy` avoids this: the API
-server evaluates the rules itself, so only clusters set to `ValidatingWebhook` depend on the
-operator being up.
-
-**The webhook's SVID is misused.**
-The operator's SVID carries the webhook's DNS name. Whoever holds it, and can redirect the webhook
-Service, could answer for the webhook and allow anything.
-*Mitigation:* SPIRE issues it only to the operator's pods (namespace, ServiceAccount and label),
-and anyone able to run a pod as the operator's ServiceAccount, or change the Service, can already
-remove the rules directly. The hub accepts no agent with the role `operator`, so the SVID can't act
-on the hub.
+**The managed cluster's RBAC is too broad.**
+Example: a team has `edit` in every namespace. Its members can start a pod with the work agent's
+ServiceAccount and role label in the agent namespace, or open a shell in the work agent's pod, and
+get cluster1's work-agent SVID.
+*Mitigation:* this RBAC is the platform's to get right, as with the existing drivers, where the
+same team can read the `hub-kubeconfig-secret`. The proposal lists what the RBAC must guarantee and
+how to check it (see Operators). An SVID taken this way stops working when it expires, and no new
+one is issued once the access is gone; a certificate taken from a Secret stays valid until it
+expires. Admission rules that would hold even with RBAC this broad were considered and left out
+(see [Alternatives](#alternatives)).
 
 **Someone runs a process inside an agent pod.**
 SPIRE attests the pod, not the process, so any process in an agent container can get the agent's
 SVID from the Workload API. Example: a user allowed to `kubectl exec` into the work agent pod runs
 a Workload API client there and acts as cluster1's work agent on the hub.
-*Mitigation:* the admission policy refuses `pods/exec` and `pods/attach` in the agent and add-on
-namespaces for everyone, and RBAC must not grant them there either (see Operators). The policy
-cannot see requests that go to the kubelet through `nodes/proxy`, so `nodes/proxy` must be limited
-to cluster admins. Anyone with node-level access can already act as any workload on that node.
-
+*Mitigation:* RBAC must grant `pods/exec`, `pods/attach` and `pods/ephemeralcontainers` in OCM's
+namespaces only to cluster admins (see Operators). `nodes/proxy` reaches the kubelet directly and
+must be limited to cluster admins too. Anyone with node-level access can already act as any
+workload on that node.
 **One trust domain acts for a cluster in another.**
 Example: `cluster2` is pinned to `east.example.org`, and the SPIRE servers of `west.example.org`
 issue `spiffe://west.example.org/ocm/cluster/cluster2/agent/work`, by mistake or because they are
@@ -1238,65 +977,19 @@ All open questions are decided.
   a `spiffe` Klusterlet in `Hosted` and `SingletonHosted`. Also cover the delete guard holding
   the finalizer for `maxSVIDLifetime` plus `maxClockSkew` after deletion, including a SPIRE clock
   ahead of the hub's and an agent holding a newer SVID with a longer TTL than any SVID the hub has seen.
-- **Admission policy tests.** For each of `Default` and `Singleton`,
-  check that the allowed role and ServiceAccount pairs are accepted, that every other pair is
-  refused (for example `klusterlet` with `<klusterlet>-registration-sa`, or a `work` pod when the
-  Klusterlet runs in `Singleton` mode), and that Jobs and Deployments not created by the operator are refused. Also check
-  that the operator deploys no agent when a policy is missing (recovery runs, with
-  `SPIFFEAdmissionReady=False`). Run the admission rule checks against a real API server twice:
-  with the policies on 1.30 or later, and through the operator's webhook, with a test SVID, on 1.30
-  or later and on an older version. Check that `ValidatingAdmissionPolicy` on an older version is
-  refused with reason `UnsupportedKubernetesVersion` and the version, by the operator and by
-  `clusteradm join`; that the operator moves between the two without recovery when the recorded
-  one is intact and with recovery when it isn't; that the webhook's CA bundle follows a SPIRE CA
-  rotation; and that without its SVID the Klusterlet waits with reason `WebhookNotReady`. Check
-  that an operator without a `spiffe` Klusterlet makes no request to the admission APIs, that a
-  `spiffe` Klusterlet is refused with reason `SPIFFEPermissionsMissing` without the
-  `klusterlet-spiffe` ClusterRole, and that the watch starts with the first `spiffe` Klusterlet.
-  Check that the Helm chart renders `klusterlet-spiffe`, the webhook Service and the operator's
-  Workload API volume only for a `spiffe` Klusterlet or with `enableSPIFFE`, and that the
-  ClusterRole's rules are the permissions the operator checks. For add-on namespaces, check that an
-  add-on pod with its own ServiceAccount and `spiffe-role: addon` is accepted when it comes from a
-  Deployment, DaemonSet or StatefulSet created by the work agent, that the same workloads created by
-  anyone else are refused, that Jobs and CronJobs are refused, and that a pod with a Klusterlet
-  ServiceAccount or role is refused. For recovery, remove the policy, then create a new DaemonSet
-  and change the image of a DaemonSet the work agent applied. Check that the operator deletes both
-  while every agent, the work agent included, is at zero, and that afterwards only the clean copy
-  re-applied from the `ManifestWork` exists. Also check that agents do not start when the built-in
-  controllers share one identity. With the policy in place, check that changing a ReplicaSet's Pod
-  template, changing a Pod's image and adding an ephemeral container are all refused, while a
-  Deployment rollout, ReplicaSet scaling and Pod status updates still work. Also check that, with
-  the policy in place, a DaemonSet or Deployment created by any other user is refused, and that a
-  ReplicaSet or Pod is refused when the requester is not the matching built-in controller or the
-  owner kind is wrong. Check that `pods/exec` and `pods/attach` on an agent or add-on pod are
-  refused, even for a user bound to the `admin` ClusterRole in that namespace, while `pods/log`
-  still works.
-- **Dedicated add-on namespace tests.** Check that an add-on whose install namespace is `default`
-  gets `RegistrationApplied=False` with reason `AddOnNamespaceNotDedicated`, that its SPIRE entry
-  issues no SVID there, and that no workload in `default` is blocked or deleted, recovery
-  included. Check that adding the `spiffe-addon-namespace` label to an existing namespace,
-  changing it is refused, removing it is refused for everyone but the operator, and the work agent
-  can create a new namespace with it. With an existing, unlabeled
-  `open-cluster-management-agent-addon`, check that the operator never labels or cleans it and
-  reports why, and that after the admin deletes it the operator recreates it labeled, records its
-  UID, and the add-ons come back in it. With the policy removed, add this Klusterlet's label to
-  `default` and to another Klusterlet's add-on namespace; check that recovery deletes nothing in
-  either, removes the label, and SPIRE issues no add-on SVID there. With two Klusterlets on one
-  managed cluster, check that one's work agent cannot create workloads in the other's add-on
-  namespaces and that recovering one leaves the other's add-ons running.
-- **Recovery and trusted state tests.** With an add-on running as a DaemonSet, remove the policy
-  and check that the DaemonSet and its Pods are gone before the Klusterlet agents scale up, and
-  that the work agent then re-applies it. For first activation, create a Deployment with
-  `klusterlet-work-sa` and `spiffe-role: work` in the agent namespace before switching the
-  Klusterlet to `spiffe`, and check that it is deleted before any agent starts. With the operator
-  stopped, delete and recreate the policy, and separately edit and restore it; when the operator
-  starts, check that it runs recovery in both cases because the recorded UID or generation no
-  longer matches. Check that an operator upgrade that changes the policy does not run recovery.
-  Edit the policy while recovery is deleting workloads and put it back before it ends; check that
-  the operator starts recovery again instead of recording the restored values. Check that
-  `SPIFFEAdmissionReady` stays `False` until the first recovery has finished. With SPIRE entries
-  created before that, check that a pod from an old Deployment gets an SVID before the cleanup,
-  is then deleted, and that the hub refuses it once its SVID expires; this is the accepted gap.
+- **Agent role policy tests.** Against a real API server on Kubernetes 1.30 or later, for each of
+  `Default` and `Singleton`: a Pod with an allowed ServiceAccount and role pair is accepted, every
+  other pair with one of the Klusterlet's ServiceAccounts is refused (for example
+  `<klusterlet>-work-sa` with `klusterlet` in `Default` mode), and changing the label afterwards is
+  refused. Pods with other ServiceAccounts, such as a second Klusterlet's agents or an add-on in
+  the same namespace, are accepted. On an older API server, and without the `klusterlet-spiffe`
+  ClusterRole, check that the operator still deploys the agents and sets
+  `SPIFFEAgentRolePolicyApplied` to `False` with reason `NotServed` or `PermissionsMissing`. Check
+  that an operator without a `spiffe` Klusterlet makes no request to the admission APIs, and that
+  the Helm chart renders `klusterlet-spiffe` only for a `spiffe` Klusterlet or with `enableSPIFFE`.
+- **RBAC tests.** Check that nothing OCM installs on the managed cluster grants a subject other
+  than OCM's own ServiceAccounts any permission listed under "What the managed cluster's RBAC must
+  guarantee".
 - **Integration tests.** envtest plus an in-process fake Workload API that issues SVIDs from a
   test CA with short TTLs. Cover register, accept, rotation and reconnect, deny, delete, add-on
   enable, rotation and disable, and the checks that no Secret or ConfigMap with hub credentials or
@@ -1313,17 +1006,20 @@ All open questions are decided.
   `Default` and `Singleton`: join, accept, ManifestWork apply and status, add-on enable and status
   sync, SVID rotation under load, and revocation of a cluster and of a single add-on. Also check
   that `clusteradm join --registration-auth spiffe --mode hosted` is refused. Run it with a managed
-  cluster on Kubernetes 1.30 or later joined with `ValidatingAdmissionPolicy`, where a Job in the
-  agent namespace is refused, and switching to the webhook and back keeps it refused without
-  restarting the agents; and with one older than 1.30 joined with `ValidatingWebhook`, where a Job
-  is refused the same way, and `ValidatingAdmissionPolicy` is refused as an unsupported version.
+  cluster on Kubernetes 1.30 or later, where a Pod with an agent ServiceAccount and the wrong role
+  label is refused, and with one older than 1.30, where the agents run without the policy.
 
 ### Graduation Criteria
 
 - **Alpha.** Behind the `SPIFFERegistration` feature gate. The `Default` and `Singleton` install
   modes and add-on registration supported; the hosted modes refused. Unit and integration tests.
-- **Beta.** E2E tests for both supported modes and add-ons in CI, `clusteradm` and add-on framework
-  support, documented SPIRE deployment requirements, and a security review.
+- **Beta.**
+  - E2E tests for both supported modes and add-ons in CI.
+  - `clusteradm` and add-on framework support.
+  - Documented SPIRE and RBAC deployment requirements, and a security review.
+  - `clusteradm join` warns when a subject other than cluster admins and OCM's ServiceAccounts
+    holds, in one of OCM's namespaces, a permission that the managed cluster's RBAC must not grant
+    (see Operators).
 - **GA.** Used in production by at least one adopter, with migration from the `grpc` driver
   documented and tested.
 
@@ -1341,12 +1037,8 @@ All open questions are decided.
   accepted with the new identity, the registration agent deletes the old `hub-kubeconfig-secret`
   and `bootstrap-hub-kubeconfig`, and, for each add-on, the `<addon>-hub-kubeconfig` Secret once
   it has written the add-on's `<addon>-spiffe` ConfigMap.
-- The switch is a first activation, so the operator runs recovery once: agents and add-on agents
-  restart from clean copies. An add-on installed into a shared namespace, such as `default`, stops
-  getting hub credentials with reason `AddOnNamespaceNotDedicated` until it is moved to a namespace
-  of its own; nothing else in the shared namespace is touched. The same applies to an existing
-  `open-cluster-management-agent-addon`: the admin moves out anything that is not an add-on and
-  deletes it, and the operator recreates it with the label.
+- Before the switch, the platform checks the managed cluster's RBAC (see Operators). Add-ons keep
+  their install namespaces, shared ones included.
 - Switching between `Default` and `Singleton` works as today. A Klusterlet in `Hosted` or
   `SingletonHosted` mode cannot switch to `spiffe`, and a `spiffe` Klusterlet cannot switch to a
   hosted mode; the API refuses both. Such clusters keep their current driver until the hosted
@@ -1357,11 +1049,9 @@ All open questions are decided.
 ### Version Skew Strategy
 
 - Managed cluster Kubernetes version. The klusterlet operator runs on every Kubernetes version
-  OCM supports, and only `spiffe` Klusterlets use the admission APIs. A `spiffe` Klusterlet gets
-  the admission rules on every version: as policies on Kubernetes 1.30 or later, or through the
-  operator's webhook on any version, as `admissionEnforcement` says (see Operators). A cluster
-  upgraded to 1.30 can then move to the policies by changing `admissionEnforcement`, without
-  recovery.
+  OCM supports, and only `spiffe` Klusterlets use the admission APIs. The agent role policy needs
+  Kubernetes 1.30 or later. On an older cluster the driver works without it, and the operator
+  installs the policy once the cluster is upgraded.
 - An agent configured for `spiffe` requires a hub that serves the `spiffe` driver. Against an
   older hub there is no SPIFFE listener, so the agents can't connect: they log the error and
   retry, and the `ManagedCluster` is never created or stops being updated. The Klusterlet's
@@ -1384,13 +1074,17 @@ All open questions are decided.
   reference SPIRE topology.
 - 2026-11-15: Scoped to the `Default` and `Singleton` install modes. `Hosted` and
   `SingletonHosted` are refused and moved to a feature to do later.
+- 2026-11-20: Based the protection of agent identities on the managed cluster's RBAC, as with the
+  existing drivers. The admission rules, the operator's webhook and the recovery steps are
+  replaced by one policy that checks the role label, and moved to Alternatives.
 
 ## Drawbacks
 
 - Requires a SPIRE deployment, with SPIRE agents on the hub and every managed cluster, which is
   significant operational work for users who do not already run it.
 - The security of cluster and add-on identity moves to SPIRE configuration (registration entries
-  and node attestation), which OCM cannot validate.
+  and node attestation), which OCM cannot validate. It also rests on the managed cluster's RBAC,
+  as with the existing drivers.
 - Add-ons that need direct hub kube-apiserver access, or hub-signed certificates, must be changed
   to use the gRPC services and their SVID.
 - Clusters in `Hosted` or `SingletonHosted` mode cannot use the driver until the hosted modes are
@@ -1410,6 +1104,24 @@ All open questions are decided.
 - **OCM registers SPIRE entries itself through the SPIRE server API.** Would automate entry
   creation, but makes OCM depend on a second external API and gives the hub the power to mint
   any identity.
+- **Admission rules that hold even when the managed cluster's RBAC is too broad.** Earlier
+  versions of this proposal had the klusterlet operator enforce, with ValidatingAdmissionPolicies
+  or its own webhook, that only the operator could create workloads in the agent namespace and
+  only the work agent in dedicated add-on namespaces, and refuse `pods/exec` for everyone. When a
+  policy was removed or changed, the operator deleted every workload in those namespaces before
+  it trusted them again. This was left out:
+  - It guards the same boundary as RBAC, and the existing drivers rely on RBAC alone for it.
+  - It can be walked around. The built-in `edit` role may create ServiceAccount tokens, and the
+    work agent is `admin` in every namespace. Example: a user with `edit` in the agent namespace
+    creates a token for `klusterlet-work-sa`, uses it to create a token for the operator's
+    ServiceAccount, and as the operator creates a Deployment that passes every rule. Closing this
+    needs rules on tokens, Secrets and the operator namespace as well.
+  - It is expensive: no shell in any add-on pod, add-ons only in dedicated namespaces, every agent
+    and add-on workload deleted whenever a policy changes, and two implementations to keep in
+    step, one for Kubernetes 1.30 or later and one for older versions.
+
+  A platform that wants this second layer can add it with its own admission policies. It could
+  also be proposed again as a separate enhancement.
 
 ## Infrastructure Needed
 
