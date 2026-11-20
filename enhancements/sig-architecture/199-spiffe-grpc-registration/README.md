@@ -234,7 +234,10 @@ not allow `spiffe-agents` in agent certificates.
     sees when the cluster is accepted again. Work and add-on requests are refused;
   - for a cluster being deleted, `ManifestWork` requests from its work agent (or singleton agent),
     so it can remove what the cluster's `ManifestWork`s applied and the deletion can finish. Every
-    other request, and every request of its registration and add-on agents, is refused.
+    other request, and every request of its registration and add-on agents, is refused;
+  - for a cluster that was deleted, nothing from an SVID issued before the deletion. The hub
+    keeps a record of the deletion for as long as such an SVID can be valid, so the cluster's
+    agent cannot create the cluster again with one (see "Deleting a cluster").
 - **In SPIRE, within one TTL.** Deleting the cluster's registration entries, or evicting its SPIRE
   agents, stops new SVIDs. SVIDs already issued stop working when they expire. Short TTLs are the
   revocation mechanism; there is no CRL in this design.
@@ -242,7 +245,8 @@ not allow `spiffe-agents` in agent certificates.
   Workload API, with no OCM change.
 
 **Unjoin.** Deleting the `ManagedCluster` on the hub and the `Klusterlet` on the managed cluster
-removes everything. There are no OCM Secrets to clean up.
+removes everything. There are no OCM Secrets to clean up, and the `ManagedCluster` does not wait
+for SVIDs to expire. The platform then removes the cluster's SPIRE entries.
 
 ### Add-ons
 
@@ -309,12 +313,12 @@ spec:
         serverSPIFFEID: spiffe://ocm-hub.example.org/ocm/hub/grpc-server
         # Optional. Default: unix:///spiffe-workload-api/spire-agent.sock
         workloadAPISocket: unix:///spiffe-workload-api/spire-agent.sock
-        # Optional. Default: 24h. Must be at least the longest SVID TTL SPIRE
-        # issues to OCM agents. The delete guard waits this long; see
-        # "Deleting a cluster".
+        # Optional. Default: 24h. The longest SVID lifetime the hub accepts from
+        # an agent; a longer-lived SVID is refused. The record of a deleted
+        # cluster is kept this long; see "Deleting a cluster".
         maxSVIDLifetime: 24h
         # Optional. Default: 5m. Allowed clock difference between SPIRE and the
-        # hub, used by the SVID validity check and added to the delete guard.
+        # hub, used by the SVID validity checks and the deletion records.
         maxClockSkew: 5m
         # Optional. The layout of agent SPIFFE IDs; every Klusterlet must use the
         # same templates. See "ID templates".
@@ -421,6 +425,9 @@ it checks in its accept step instead:
   drivers, isn't the `spiffe` driver's to decide: it agrees, and the other drivers decide. This is
   no way around `autoApprovedIdentities`. Such a cluster has no pin, so the hub serves no SPIFFE
   agent for it until an admin pins it.
+- The `spiffe` driver does not agree while the deletion of a cluster with the same name is on
+  record (see "Deleting a cluster"). A cluster that was just deleted comes back accepted only if
+  an admin accepts it.
 
 Example: with `spiffe://ocm-hub.example.org/ocm/cluster/*/agent/registration`, a cluster that
 cluster1's registration agent creates is accepted at once. A cluster registered by
@@ -671,7 +678,9 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   and every stream and unary call on it. For example, if an agent connects at 10:40 with an SVID
   valid until 11:00, the hub closes that connection at 11:00. The agent then opens a new connection,
   with a new handshake, using its newer SVID. As a second check, unary and stream interceptors in
-  `pkg/server/grpc/authn` reject any RPC whose peer SVID has already expired.
+  `pkg/server/grpc/authn` reject any RPC whose peer SVID has already expired. The wrapper also
+  refuses, in the handshake, a client SVID that lives longer than the configured maximum, and
+  records the SVID's `NotBefore` for the deletion records (see "Deleting a cluster").
 - **Client TLS** (`pkg/cloudevents/generic/options/grpc`). A client option dials the hub with the
   agent's SVID and accepts only the configured hub ID:
   `tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeID(hubSPIFFEID))`. A server that
@@ -719,8 +728,10 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   Two checks decide what a reconnecting agent of such a cluster may do. Before the
   SubjectAccessReview, a gate on the listener refuses by identity: an existing cluster must be
   pinned, and the SVID's trust domain must be the one it is pinned to; the registration and add-on
-  agents of a cluster being deleted, the
-  work and add-on agents of a denied cluster, and the agent of a disabled add-on are refused.
+  agents of a cluster being deleted, the work and add-on agents of a denied cluster, and the agent
+  of a disabled add-on are refused. So is an SVID issued before a deletion of its cluster that is
+  still on record (see "Deleting a cluster").
+
   Inside the SubjectAccessReview authorizer, once the request's data type is known, a second check
   (sdk-go `SARAuthorizer.WithSPIFFECheck`) allows a cluster being deleted only `ManifestWork`
   requests and a denied cluster only its `ManagedCluster`, lease and events. The second check is
@@ -728,48 +739,56 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   to the same rules.
 - **Deleting a cluster** (`pkg/registration/hub`). Closing connections does not cancel an SVID
   that is still valid. Without a guard, an agent whose cluster was just deleted could reconnect and
-  use its pre-acceptance permission to create the `ManagedCluster` again. To prevent this:
-  - The hub uses one upper bound for every deletion: `spiffe.maxSVIDLifetime` from the
-    `ClusterManager` (default `24h`). It must be at least as long as the longest SVID TTL SPIRE
-    issues to OCM agents. The hub does not try to learn the lifetime from the SVIDs it sees,
-    because an agent can hold a newer, longer-lived SVID that it has not shown to the hub yet, for
-    example after the platform raises the TTL.
-  - In `spiffe` mode each `ManagedCluster` gets the finalizer
-    `open-cluster-management.io/spiffe-revocation`; a cluster an agent creates gets it in the same
-    write, so even one deleted at once is held. When the cluster is deleted, the hub keeps the
-    finalizer until the deletion time plus `maxSVIDLifetime` plus `maxClockSkew` (default `5m`)
-    has passed. The skew term covers a SPIRE server whose clock is ahead of the hub's: an SVID it
-    issued just before the deletion can expire up to that much later by the hub's clock. Every
-    SVID issued before the deletion has expired by then, including newer ones the agent received but has not
-    yet shown to the hub. While the object is terminating, a create fails because the name still
-    exists, and the authorizer refuses every request from the cluster's identities except the
-    work agent's `ManifestWork` requests. The hub deletes the cluster's `ManifestWork`s and keeps
-    the work agent's RoleBinding until they are gone, as with the other drivers; only the work
-    agent can remove what they applied and release their finalizers.
-  - Then the finalizer is removed and the object goes away.
-  - The guard keeps running while any `ManagedCluster` has the finalizer, also after `spiffe` is
-    removed from `registrationDrivers`, so a cluster deleted then is still released after the same
-    wait instead of staying terminating.
+  use its pre-acceptance permission to create the `ManagedCluster` again. The hub does not wait
+  for those SVIDs to expire. It remembers the deletion and refuses the SVIDs issued before it:
+  - **A limit on SVID lifetime.** In the TLS handshake, the hub refuses an agent SVID whose
+    lifetime (`NotAfter` minus `NotBefore`) is longer than `spiffe.maxSVIDLifetime` from the
+    `ClusterManager` (default `24h`). The setting has to be a little above SPIRE's TTL, because
+    SPIRE dates `NotBefore` a few seconds back. If the platform raises SPIRE's TTL above the limit,
+    the agents fail to connect, with an error that names the setting. The guard is never weakened
+    without anyone noticing.
+  - **A deletion record.** Each `ManagedCluster` pinned to a trust domain (see "Trust domains")
+    gets the finalizer `open-cluster-management.io/spiffe-revocation`. When the cluster is
+    deleted, the registration controller writes a record and then removes the finalizer at once.
+    The record is a ConfigMap in the hub namespace, named after the deleted object's UID. It holds
+    the cluster's name and its deletion time, and nothing secret. The controller deletes the
+    record when the deletion time plus `maxSVIDLifetime` plus `maxClockSkew` (default `5m`) has
+    passed. By then every SVID the record refuses has expired: such an SVID was issued before the
+    deletion time plus `maxClockSkew`, and lives no longer than `maxSVIDLifetime`.
+  - **What a record does.** While a record for a cluster exists, the hub refuses every request
+    for that cluster from an SVID issued earlier than the deletion time plus `maxClockSkew`. The
+    hub reads the issue time from the SVID's `NotBefore`, which SPIRE sets to the time of issue,
+    a few seconds back. The skew term covers a SPIRE server whose clock is ahead of the hub's.
+    For a request to create the cluster, the hub reads the records from the API server and not
+    from a cache, so a record written a moment ago counts.
 
-  Example: SVIDs live 1 hour, `maxSVIDLifetime` is set to `1h`, `maxClockSkew` is `5m`, and `c1`
-  is deleted at 10:40. Until 11:45 the agent cannot recreate `c1`, and can use the hub only to
-  clean up `c1`'s `ManifestWork`s. After that
-  it can register again only with an SVID issued after the deletion, which means SPIRE is still issuing it
-  identities. With the default `24h`, the wait is longer but just as safe.
+    There is one exception: while the deleted object still exists, its work agent may send
+    `ManifestWork` requests, to remove what the cluster's `ManifestWork`s applied. The hub deletes
+    the `ManifestWork`s and keeps the work agent's RoleBinding until they are gone, as with the
+    other drivers. The `spiffe` driver also never accepts a cluster automatically while a record
+    for its name exists.
+  - **Nothing waits.** The `ManagedCluster` goes away as soon as its `ManifestWork`s are cleaned
+    up, as with the other drivers, and its name is free again.
 
-  To keep the cluster out for good, the platform must remove the cluster's SPIRE registration
-  entries *before* it deletes the `ManagedCluster`, and also remove what creates them. With the
-  SPIRE controller manager, that means deleting or changing the cluster's `ClusterSPIFFEID`
-  objects first; deleting only the generated entries is not enough, because the controller manager
-  recreates them on its next reconcile. Then the last SVID SPIRE issued for the cluster is older
-  than the deletion time, and the wait covers it. If the
-  entries were removed later, for example near the end of the wait, an SVID issued just before
-  removal could still be valid after the finalizer goes and could recreate the cluster. OCM cannot
-  check the order, because it does not talk to the SPIRE server, so this is a documented step in
-  the cluster removal procedure. The cleanup uses the last SVID the work agent received, so the
-  `ManagedCluster` must be deleted soon after the entries are removed, while that SVID is still
-  valid: at least half the SVID TTL, because SPIRE renews at half-life. If it has expired, the
-  `ManifestWork`s stay terminating until someone removes what they applied by hand.
+  Example: SVIDs live 1 hour and `c1` is deleted at 10:40. The work agent, whose SVID is from
+  10:20, cleans up `c1`'s `ManifestWork`s, and `c1` is gone at 10:41. The registration agent
+  reconnects with its SVID from 10:25 and tries to create `c1`. The hub refuses, because 10:25 is
+  before 10:45. If SPIRE still issues SVIDs for `c1`, the agent's SVID is renewed at 10:55. With
+  that one the agent creates `c1` again, as a new cluster that waits for an admin, even if its ID
+  is in `autoApprovedIdentities`.
+
+  To keep the cluster out for good, the platform removes the cluster's SPIRE registration entries
+  and what creates them. With the SPIRE controller manager, that means deleting or changing the
+  cluster's `ClusterSPIFFEID` objects; deleting only the generated entries is not enough, because
+  the controller manager recreates them on its next reconcile. The order is not critical. The
+  best one is to delete the `ManagedCluster` first and remove the entries once it is gone, so the
+  work agent has a valid SVID for the cleanup. If the entries are removed late, the worst case is
+  the one in the example: the cluster shows up again, not accepted, and the admin deletes it once
+  more.
+
+  When the `spiffe` driver is not enabled, the registration controller removes the
+  `spiffe-revocation` finalizer from every `ManagedCluster`, so turning the driver off leaves no
+  cluster that cannot be deleted.
 - **Operators** (`pkg/operator`). Render the SPIFFE version of the gRPC server Deployment and of
   each agent Deployment, for the `Default` and `Singleton` install modes. Refuse a `spiffe`
   Klusterlet in a hosted mode (see API).
@@ -876,11 +895,11 @@ only the trust domains in `agentTrustDomains`, however many its SPIRE federates 
 **A deleted cluster comes back.**
 Example: an admin deletes `ManagedCluster/c1`, but its agent still has an SVID valid for 40
 minutes. It reconnects and creates `c1` again.
-*Mitigation:* the `spiffe-revocation` finalizer keeps `c1` terminating, so it cannot be recreated
-and all its requests are denied, until every SVID issued before the deletion has expired (see
-"Deleting a cluster"). To keep the cluster out for good, the platform removes its SPIRE
-registration entries, and the `ClusterSPIFFEID` objects or other source that creates them, before
-deleting the `ManagedCluster`.
+*Mitigation:* the hub records the deletion and refuses every SVID issued before it, for as long
+as such an SVID can be valid (see "Deleting a cluster"). An agent that SPIRE still issues SVIDs to
+can register `c1` again, but only as a new cluster that is not accepted until an admin accepts it.
+To keep the cluster out for good, the platform removes its SPIRE registration entries, and the
+`ClusterSPIFFEID` objects or other source that creates them.
 
 **Agents of other drivers get the SPIFFE pre-acceptance permission.**
 Example: the hub runs `csr` and `spiffe` during a migration. If the pre-acceptance ClusterRole were
@@ -946,8 +965,8 @@ token can start the join flow. Network-level protection is still advisable.
 Example: a managed cluster's clock is 3 minutes ahead, so a fresh SVID looks "not valid yet" to
 the hub.
 *Mitigation:* clusters must run NTP, and the expiry check allows a small clock difference,
-`spiffe.maxClockSkew` on the `ClusterManager` (default `5m`). The delete guard adds the same
-allowance to its wait.
+`spiffe.maxClockSkew` on the `ClusterManager` (default `5m`). The deletion records use the same
+allowance.
 
 Security review should involve the SIG Architecture maintainers and someone familiar with SPIRE
 deployments.
@@ -972,7 +991,8 @@ All open questions are decided.
    accepts a cluster automatically when the SPIFFE ID that created it matches the driver's
    `autoApprovedIdentities`, as the `csr` and `grpc` drivers do for their users (see
    "Acceptance"). As with the other drivers, this happens only the first time a cluster joins;
-   an admin can deny it afterwards, and it is not accepted again automatically.
+   an admin can deny it afterwards, and it is not accepted again automatically. A cluster that was
+   deleted is not accepted automatically either, while its deletion is on record.
 3. **Should the `ManagedCluster` be created by the agent on first connection, or be pre-created
    by the admin with the agent only allowed to update its status?** Both. If the
    `ManagedCluster` does not exist, the registration agent creates it, pinned to its SVID's trust
@@ -1001,9 +1021,16 @@ All open questions are decided.
   expiry (including that no further unary or stream RPC succeeds on that connection), connection
   shutdown on cluster deny or delete and on add-on disable, and operator
   rendering of the SPIFFE Deployments for `Default` and `Singleton`, and the operator's refusal of
-  a `spiffe` Klusterlet in `Hosted` and `SingletonHosted`. Also cover the delete guard holding
-  the finalizer for `maxSVIDLifetime` plus `maxClockSkew` after deletion, including a SPIRE clock
-  ahead of the hub's and an agent holding a newer SVID with a longer TTL than any SVID the hub has seen.
+  a `spiffe` Klusterlet in `Hosted` and `SingletonHosted`. Also cover the deletion records:
+  - The record is written before the finalizer is removed, and deleted after `maxSVIDLifetime`
+    plus `maxClockSkew`.
+  - An SVID issued before the deletion is refused for every request, including with a SPIRE clock
+    ahead of the hub's. The only exception is the work agent's `ManifestWork` cleanup of the
+    object being deleted.
+  - An SVID issued after the deletion can create the cluster again, and that cluster is not
+    accepted automatically while the record exists.
+  - An SVID that lives longer than `maxSVIDLifetime` is refused in the handshake.
+  - The finalizer is removed from every cluster when the driver is disabled.
 - **Agent role policy tests.** Against a real API server on Kubernetes 1.30 or later, for each of
   `Default` and `Singleton`: a Pod with an allowed ServiceAccount and role pair is accepted, every
   other pair with one of the Klusterlet's ServiceAccounts is refused (for example
@@ -1115,6 +1142,8 @@ All open questions are decided.
   replaced by one policy that checks the role label, and moved to Alternatives.
 - 2026-11-20: Bound the pre-acceptance permission to a group of its own, and made the trust domain
   pin an explicit admin step for every cluster a SPIFFE agent did not create.
+- 2026-11-20: Replaced the wait after a cluster deletion with a deletion record: the hub refuses
+  SVIDs issued before the deletion, and the `ManagedCluster` is removed without delay.
 
 ## Drawbacks
 
@@ -1160,6 +1189,16 @@ All open questions are decided.
 
   A platform that wants this second layer can add it with its own admission policies. It could
   also be proposed again as a separate enhancement.
+- **Keep a deleted `ManagedCluster` terminating until its SVIDs have expired.** An earlier version
+  held the deleted object with a finalizer for `maxSVIDLifetime` plus `maxClockSkew`, so that an
+  old SVID could not create it again. That is simple, but:
+  - Every deletion takes 24 hours by default, and a rebuilt cluster cannot rejoin under the same
+    name until then.
+  - The wait is too short, with nothing to show it, if SPIRE's TTL is raised above the setting.
+  - The SPIRE entries have to be removed before the deletion, at the moment the work agent still
+    needs an SVID to clean up.
+
+  Refusing SVIDs by their issue time needs one small record on the hub and no wait.
 
 ## Infrastructure Needed
 
