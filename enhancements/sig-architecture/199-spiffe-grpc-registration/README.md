@@ -303,7 +303,9 @@ longer obtains credentials on the add-on's behalf.
    permission configuration, bound to the add-on's user and groups.
 2. On the managed cluster, the registration agent sees the registration and, with the `spiffe`
    add-on driver, creates no CSR, no token request and no Secret. It sets
-   `status.registrations[].kubeClient.driver: spiffe` and the `RegistrationApplied` condition.
+   `status.registrations[].kubeClient.driver: spiffe` and reports the result in a condition of
+   its own, `SPIFFEConfigApplied`. `RegistrationApplied` stays the add-on manager's condition;
+   the registration agent never writes it.
 3. The add-on agent fetches its own SVID (`.../cluster/<cluster>/addon/<addon>/agent/<agent>`)
    from the local Workload API and connects to the hub gRPC server over mTLS, as the Klusterlet
    agents do.
@@ -313,6 +315,23 @@ longer obtains credentials on the add-on's behalf.
 If an add-on sets a custom `kubeClient` subject that does not match the mapping for its SPIFFE ID,
 the add-on manager sets `RegistrationApplied` to false with a clear reason, because no SVID can
 carry that subject.
+
+**An add-on says that it is built for this driver.** An agent written for a hub kubeconfig cannot
+use an SVID, so support is declared, never assumed. The declaration is the annotation
+`addon.open-cluster-management.io/spiffe-supported: "true"` on the `ManagedClusterAddOn`:
+
+- An add-on built with the add-on framework opts in through its registration option, and the
+  framework sets the annotation.
+- An add-on template carries the annotation on its `AddOnTemplate`, and the ocm add-on manager
+  copies it.
+
+On a `spiffe` cluster the registration agent acts on it. With the annotation it writes the
+add-on's `<addon>-spiffe` ConfigMap and sets `SPIFFEConfigApplied=True`. Without it, it writes
+nothing and sets `SPIFFEConfigApplied=False` with reason `AddOnNotSPIFFEReady`. An add-on manager
+built before this driver never sets the annotation, so its add-ons are reported the same way.
+Example: managed-serviceaccount, unchanged, on a `spiffe` cluster. Its Deployment still mounts
+`managed-serviceaccount-hub-kubeconfig`, which no longer exists, so the Pod does not start, and
+its `ManagedClusterAddOn` says `AddOnNotSPIFFEReady`.
 
 **The agent name must be fixed.** The `<agent>` part of an add-on agent's SPIFFE ID is the agent
 name in the user of the add-on's `kubeClient` subject, `...:addon:<addon>:agent:<agent>`. The
@@ -335,10 +354,12 @@ that is all it does on the hub.
 **Add-ons that cannot run on a `spiffe` cluster yet.** An add-on whose agent reads or writes other
 hub resources with a hub kubeconfig, such as managed-serviceaccount, or needs a certificate from a
 `customSigner`, such as cluster-proxy, does not work on a cluster that uses this driver. Its
-`ManagedClusterAddOn` shows why. Because `addOnKubeClientRegistrationDriver` must be `spiffe` when
-the registration driver is, this holds for every add-on on the cluster. Such an add-on has to be
-changed to use the gRPC services, or wait until the gRPC server offers a way to reach other hub
-resources (see [Graduation Criteria](#graduation-criteria)).
+`ManagedClusterAddOn` shows why, in `SPIFFEConfigApplied`: reason `AddOnNotSPIFFEReady` for an
+add-on that has not declared support, and `CustomSignerNotSupported` for a `customSigner`
+registration. Because `addOnKubeClientRegistrationDriver` must be `spiffe` when the registration
+driver is, this holds for every add-on on the cluster. Such an add-on has to be changed to use
+the gRPC services, or wait until the gRPC server offers a way to reach other hub resources (see
+[Graduation Criteria](#graduation-criteria)).
 
 **Renew.** Exactly as for the Klusterlet agents: SPIRE rotates the add-on agent's SVID, and the
 hub closes connections whose SVID has expired.
@@ -541,9 +562,13 @@ status:
     status: "True"
 ```
 
-**Add-ons.** `ManagedClusterAddOn` (`v1beta1`) gets one new allowed value, `spiffe`, for
-`status.registrations[].kubeClient.driver`. The registration agent sets it so the hub can see how
-the add-on authenticates. No new registration type is needed.
+**Add-ons.** `ManagedClusterAddOn` gets one new allowed value, `spiffe`, for the add-on's driver:
+`status.registrations[].kubeClient.driver` in `v1beta1`, and `status.kubeClientDriver` in
+`v1alpha1`. Both need it, because `v1alpha1` is the stored version and a `v1beta1` value is
+converted into it. The registration agent sets the driver so the hub can see how the add-on
+authenticates. No new registration type is needed. The API also gets one condition type,
+`SPIFFEConfigApplied`, which the registration agent sets, and one annotation,
+`addon.open-cluster-management.io/spiffe-supported` (see [Add-ons](#add-ons)).
 
 All new fields sit behind a new `SPIFFERegistration` feature gate.
 
@@ -554,12 +579,13 @@ All new fields sit behind a new `SPIFFERegistration` feature gate.
 | Feature gate | `SPIFFERegistration` | hub and agents | admin |
 | Annotation | `open-cluster-management.io/spiffe-trust-domain` | `ManagedCluster` | hub gRPC server, or a user who may accept the cluster |
 | Annotation | `open-cluster-management.io/spiffe-registered-by` | `ManagedCluster` | hub gRPC server |
-| Annotation | `agent.open-cluster-management.io/klusterlet-name` | `ManagedCluster` | registration agent of a `spiffe` Klusterlet |
+| Annotation | `addon.open-cluster-management.io/spiffe-supported` | `ManagedClusterAddOn`, `AddOnTemplate` | add-on manager, add-on template author |
 | Finalizer | `open-cluster-management.io/spiffe-revocation` | `ManagedCluster` | hub gRPC server, `ManagedCluster` mutating webhook, registration controller |
 | Group | `system:open-cluster-management:spiffe:agents` | Klusterlet agents on the SPIFFE listener | hub gRPC server |
-| Label | `open-cluster-management.io/spiffe-role` | agent and add-on Pods | klusterlet operator, add-on framework |
+| Label | `open-cluster-management.io/spiffe-role` | agent and add-on Pods | klusterlet operator, add-on framework, ocm add-on manager |
 | Condition | `SPIFFEAgentRolePolicyApplied` | `Klusterlet` | klusterlet operator |
 | Condition reasons | `InvalidSPIFFEConfiguration`, `SPIFFEInstallModeNotSupported` | `Klusterlet`, `Applied` | klusterlet operator |
+| Condition | `SPIFFEConfigApplied`, with reasons `AddOnNotSPIFFEReady` and `CustomSignerNotSupported` | `ManagedClusterAddOn` | registration agent |
 | Condition reason | `SubjectNotSupportedBySPIFFE` | `ManagedClusterAddOn`, `RegistrationApplied` | add-on manager |
 | ConfigMap | `<addon>-spiffe` | add-on install namespace | registration agent |
 | ConfigMap | deletion record, named after the deleted cluster's UID | hub namespace | registration controller |
@@ -641,6 +667,10 @@ ServiceAccounts of OCM and of the add-ons themselves may:
 - create ServiceAccount tokens (`serviceaccounts/token`), impersonate ServiceAccounts, or read or
   create Secrets. A Secret of type `kubernetes.io/service-account-token` gets a long-lived token
   for the ServiceAccount it names.
+- create or change ConfigMaps in an add-on install namespace. The `<addon>-spiffe` ConfigMap
+  there tells the add-on agent where the hub is and which SPIFFE ID the hub must present.
+  Changed, it sends the agent to another server that holds an SVID in a trust domain the agent
+  trusts.
 
 The built-in `edit` and `admin` ClusterRoles include all of these except
 `pods/ephemeralcontainers`, so they must not be bound in those namespaces, neither by a
@@ -668,6 +698,7 @@ kubectl get clusterrolebindings -o wide
 kubectl auth can-i create pods -n open-cluster-management-agent --as <user>
 kubectl auth can-i create pods/exec -n open-cluster-management-agent --as <user>
 kubectl auth can-i create serviceaccounts/token -n open-cluster-management-agent --as <user>
+kubectl auth can-i update configmaps -n open-cluster-management-agent-addon --as <user>
 ```
 
 **The one check RBAC cannot express.** RBAC decides who may create a Pod. It cannot say how the
@@ -706,8 +737,9 @@ refused.
   needs no permission on them, on any Kubernetes version.
 
 **Add-on agents.** Add-on pods use their own ServiceAccounts and the role label value `addon`,
-which the add-on framework sets. An add-on's SPIRE entry selects on its install namespace, its
-ServiceAccount and that label. For example, for the agent of `my-addon` on `cluster1`:
+which the add-on framework sets, or ocm for an add-on template. An add-on's SPIRE entry selects
+on its install namespace, its ServiceAccount and that label. For example, for the agent of
+`my-addon` on `cluster1`:
 
 ```yaml
 apiVersion: spire.spiffe.io/v1alpha1
@@ -799,8 +831,16 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   operator passes them to the hub as `--spiffe-auto-approved-identities`.
 - **Add-on registration on the managed cluster** (`pkg/registration/spoke/addon`). With the
   `spiffe` add-on driver, the registration agent no longer creates a CSR, token or
-  `<addon>-hub-kubeconfig` Secret for `kubeClient` registrations. A `customSigner` registration is
-  refused with a clear condition, because the hub does not sign certificates in this mode.
+  `<addon>-hub-kubeconfig` Secret for `kubeClient` registrations. The `csr` and `token` drivers
+  report in conditions of their own, `ClusterCertificateRotated` and `TokenRefreshed`. The
+  `spiffe` driver does the same, in `SPIFFEConfigApplied`:
+  - `True` once it has written the add-on's `<addon>-spiffe` ConfigMap.
+  - `False` with reason `AddOnNotSPIFFEReady` when the `ManagedClusterAddOn` lacks the
+    `spiffe-supported` annotation. It writes no ConfigMap.
+  - `False` with reason `CustomSignerNotSupported` for a `customSigner` registration, because
+    the hub does not sign certificates in this mode.
+
+  It does not write `RegistrationApplied`; only the add-on manager does.
 - **Add-on manager on the hub** (addon-framework `pkg/addonmanager/controllers/registration`,
   which the ocm add-on manager runs). Checks that an add-on's `kubeClient` subject can be carried
   by an SVID. For example, the default subject
@@ -810,6 +850,18 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   condition with reason `SubjectNotSupportedBySPIFFE`. The comparison uses the full mapped
   identity, including `system:authenticated`, so a default subject that lists that group still
   matches.
+- **Add-on templates** (`pkg/addon/templateagent`). An add-on made from an `AddOnTemplate` does
+  not go through the add-on framework's rendering: ocm's own decorator puts the hub kubeconfig
+  into its workloads. For a template that declares SPIFFE support, on a cluster whose
+  registration agent has reported `driver: spiffe`, the decorator changes what it adds:
+  - It mounts the `<addon>-spiffe` ConfigMap where it mounts the `<addon>-hub-kubeconfig`
+    Secret today, as volume `hub-kubeconfig` at `/managed/hub-kubeconfig`.
+  - It adds the `csi.spiffe.io` volume to every container, init containers too.
+  - It sets the `spiffe-role: addon` label on the Pod.
+  - It no longer sets `HUB_KUBECONFIG`.
+
+  The add-on manager copies the template's `spiffe-supported` annotation to the
+  `ManagedClusterAddOn`. Unit tests cover Deployments, DaemonSets and StatefulSets.
 - **gRPC server** (`pkg/server/grpc`). The `spiffe` driver gets its own listener, on its own port
   and Service (`cluster-manager-grpc-server-spiffe`), exposed through an `endpointsExposure` entry
   with `protocol: grpc-spiffe`. That listener uses only the SPIFFE TLS credentials and the SPIFFE
@@ -927,11 +979,13 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   Klusterlet in a hosted mode (see API).
 - **Agents.** The registration agent does not start its Secret-based hub-kubeconfig controller.
   The work agent and add-on agents fetch their own SVIDs instead of reading a Secret written by
-  the registration agent. For each add-on with the `spiffe` driver, the registration agent writes
-  a ConfigMap, `<addon>-spiffe`, in the add-on's install namespace, with the settings the add-on
-  agent needs and nothing secret: `hub-endpoint`, `hub-spiffe-id`, `agent-spiffe-id` (rendered
-  from the add-on agent ID template) and `workload-api-socket`. It deletes the ConfigMap when the
-  registration goes away.
+  the registration agent. For each add-on that declares SPIFFE support, the registration agent
+  writes a ConfigMap, `<addon>-spiffe`, in the add-on's install namespace, with the settings the
+  add-on agent needs and nothing secret: `hub-endpoint`, `hub-spiffe-id`, `agent-spiffe-id`
+  (rendered from the add-on agent ID template) and `workload-api-socket`. It watches the
+  ConfigMap and puts it back when someone changes or deletes it, and deletes it when the
+  registration goes away. For this, the registration agent's add-on ClusterRole, which covers
+  Secrets and Leases today, also covers ConfigMaps for a `spiffe` Klusterlet.
 - **Klusterlet operator.** Install the agent role policy and its binding where the API is served,
   and report it in the `SPIFFEAgentRolePolicyApplied` condition (see Operators).
 
@@ -939,18 +993,22 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
 
 - A helper that builds an add-on agent's gRPC clients from its SVID, so add-on authors do not
   have to handle SVIDs themselves.
-- When a cluster uses the `spiffe` add-on driver, the add-on Deployments, DaemonSets and
-  StatefulSets the framework renders are changed: the `<addon>-hub-kubeconfig` Secret, mounted as
-  a volume or as a source of a projected volume, becomes the `<addon>-spiffe` ConfigMap, under the
-  same volume name and mount path; every container, init containers too, mounts the
-  `csi.spiffe.io` volume; and the pod gets the `spiffe-role: addon` label.
-  Unit tests cover all three kinds, typed and unstructured.
-- The framework knows that a cluster's add-ons use `spiffe` from the `ManagedCluster` annotation
-  `agent.open-cluster-management.io/klusterlet-name`, which the registration agent of a `spiffe`
-  Klusterlet sets when it creates or updates the cluster. On such a cluster, the framework renders
-  an add-on only after the registration agent has reported the add-on's `kubeClient` driver in
-  `status.registrations`. Rendered earlier, the add-on would mount a hub kubeconfig Secret that is
-  never created.
+- A registration option with which an add-on declares that its agent is built for this driver.
+  For such an add-on the framework sets the `spiffe-supported` annotation on each
+  `ManagedClusterAddOn` (see [Add-ons](#add-ons)).
+- For an add-on that has declared support, on a cluster whose registration agent has reported
+  `driver: spiffe`, the add-on Deployments, DaemonSets and StatefulSets the framework renders are
+  changed: the `<addon>-hub-kubeconfig` Secret, mounted as a volume or as a source of a projected
+  volume, becomes the `<addon>-spiffe` ConfigMap, under the same volume name and mount path;
+  every container, init containers too, mounts the `csi.spiffe.io` volume; and the pod gets the
+  `spiffe-role: addon` label. Add-on authors write the Secret volume in their own manifests
+  today, so the framework makes the change after rendering. Unit tests cover all three kinds,
+  typed and unstructured.
+- The framework knows that a cluster's add-ons use `spiffe` from the driver the registration
+  agent reports in `status.registrations`, as it does for the `token` driver. Before that
+  report, the first render of a newly enabled add-on can still be the Secret form. Its Pod waits
+  for a Secret that is never created, and the next render replaces it. A cluster that moves from
+  another driver goes through the same change.
 - `pkg/spiffeclient` is the client helper: it reads the `<addon>-spiffe` settings from the mounted
   directory, opens the Workload API and builds the gRPC options.
 - An example add-on, `helloworld-spiffe`, shows a manager and an agent written for the driver,
@@ -1084,6 +1142,14 @@ Example: the agent of `my-addon` on cluster1 tries to update `other-addon`'s sta
 *Mitigation:* the hub checks both the cluster and the add-on in the SVID against every request.
 Add-on entries select on the add-on's namespace and ServiceAccount.
 
+**Someone points an add-on agent at another server.**
+Example: a user who may edit ConfigMaps in an add-on's namespace changes `hub-endpoint` and
+`hub-spiffe-id` in `my-addon-spiffe` to a server of their own, which holds an SVID in the same
+trust domain. The add-on agent accepts that server as the hub and acts on what it sends.
+*Mitigation:* writing ConfigMaps in an add-on install namespace is part of what the managed
+cluster's RBAC must keep to cluster admins and OCM (see Operators), as writing its Secrets is
+today. The registration agent also puts a changed `<addon>-spiffe` ConfigMap back.
+
 **SPIRE is down.**
 If an agent cannot reach its local Workload API, it cannot get a new SVID.
 *Mitigation:* open connections keep working until the current SVID expires. Example: with a 1-hour
@@ -1195,7 +1261,8 @@ All open questions are decided.
   that no further unary or stream RPC succeeds on that connection), connection shutdown on
   cluster deny or delete and on add-on disable, and operator rendering of the SPIFFE Deployments
   for `Default` and `Singleton`, and the operator's refusal of a `spiffe` Klusterlet in `Hosted`
-  and `SingletonHosted`. Also cover the deletion records:
+  and `SingletonHosted`. For add-on templates, check the decorator's SPIFFE form. Also cover the
+  deletion records:
   - The record is written before the finalizer is removed, and deleted after `maxSVIDLifetime`
     plus `maxClockSkew`.
   - The finalizer is on the object from the write that pins it: an agent's create, and an
@@ -1239,11 +1306,15 @@ All open questions are decided.
   the `grpc` listener, on create and on update. With `spiffe` enabled next to `csr` and `grpc`,
   check that a `csr` agent on the hub kube-apiserver and a `grpc` agent on its listener can still
   read only their own `ManagedCluster` and create no other. For add-ons, check that a
-  `customSigner` registration, and a `kubeClient` subject that no SVID can carry, are reported on
-  the `ManagedClusterAddOn` and not served.
+  `customSigner` registration, an add-on without the `spiffe-supported` annotation, and a
+  `kubeClient` subject that no SVID can carry, are reported on the `ManagedClusterAddOn` and not
+  served. Check that an add-on with the annotation gets its `<addon>-spiffe` ConfigMap and
+  `SPIFFEConfigApplied=True`, and that a changed `<addon>-spiffe` ConfigMap is put back.
 - **API tests.** The `Klusterlet` CRD accepts `spiffe` with `deployOption.mode` empty, `Default`
   or `Singleton`, refuses it with `Hosted` and `SingletonHosted`, still accepts other drivers in
-  the hosted modes, and refuses moving a `spiffe` Klusterlet to a hosted mode.
+  the hosted modes, and refuses moving a `spiffe` Klusterlet to a hosted mode. The
+  `ManagedClusterAddOn` CRD accepts the driver `spiffe` in `v1beta1` and in `v1alpha1`, and an
+  add-on with that driver can be updated through either version.
 - **E2E tests.** kind clusters with SPIRE installed from the SPIFFE Helm charts, run for each of
   `Default` and `Singleton`: join, accept, ManifestWork apply and status, add-on enable and status
   sync, SVID rotation under load, and revocation of a cluster and of a single add-on. Also check
@@ -1254,10 +1325,13 @@ All open questions are decided.
 ### Graduation Criteria
 
 - **Alpha.** Behind the `SPIFFERegistration` feature gate. The `Default` and `Singleton` install
-  modes and add-on registration supported; the hosted modes refused. Unit and integration tests.
+  modes and add-on registration supported; the hosted modes refused. Add-on registration includes
+  the add-on framework's part, without which no add-on can use the driver: the declaration of
+  support, the changed rendering, the client helper and the `helloworld-spiffe` example. Unit
+  and integration tests.
 - **Beta.**
   - E2E tests for both supported modes and add-ons in CI.
-  - `clusteradm` and add-on framework support.
+  - `clusteradm` support.
   - Documented SPIRE and RBAC deployment requirements, and a security review.
   - `clusteradm join` warns when a subject other than cluster admins and OCM's ServiceAccounts
     holds, in one of OCM's namespaces, a permission that the managed cluster's RBAC must not grant
@@ -1282,14 +1356,19 @@ All open questions are decided.
   server under ocm), so agents that have not migrated keep their current endpoint and credentials.
 - Because the OCM groups are the same as with the `csr` and `grpc` drivers and the add-on
   framework defaults, and the hub RBAC is bound to the groups, an existing cluster keeps its
-  ManagedCluster, namespace, ManifestWorks, add-ons and RBAC when its Klusterlet switches to
-  `spiffe`. An admin first pins the cluster to its trust domain, for example with
+  ManagedCluster, namespace, ManifestWorks and RBAC when its Klusterlet switches to `spiffe`. An
+  admin first pins the cluster to its trust domain, for example with
   `clusteradm accept --clusters cluster1 --spiffe-trust-domain ocm-hub.example.org`; until then the
   hub serves no SPIFFE agent for it. Once the registration agent is connected with its SVID, it
-  deletes the old `hub-kubeconfig-secret` and `bootstrap-hub-kubeconfig`, and, for each add-on,
-  the `<addon>-hub-kubeconfig` Secret once it has written the add-on's `<addon>-spiffe` ConfigMap.
-- Before the switch, the platform checks the managed cluster's RBAC (see Operators). Add-ons keep
+  deletes the old `hub-kubeconfig-secret` and `bootstrap-hub-kubeconfig`, and every add-on's
+  `<addon>-hub-kubeconfig` and client-certificate Secret.
+- Add-ons do not move by themselves. An add-on keeps running after the switch only if it has
+  declared SPIFFE support (see [Add-ons](#add-ons)). Any other add-on stops at the switch, when
+  its Secret is deleted, and its `ManagedClusterAddOn` shows `SPIFFEConfigApplied=False`. Before
+  the switch, the admin checks each `ManagedClusterAddOn` of the cluster for the
+  `spiffe-supported` annotation, and upgrades or disables the add-ons that lack it. Add-ons keep
   their install namespaces, shared ones included.
+- Before the switch, the platform checks the managed cluster's RBAC (see Operators).
 - Switching between `Default` and `Singleton` works as today. A Klusterlet in `Hosted` or
   `SingletonHosted` mode cannot switch to `spiffe`, and a `spiffe` Klusterlet cannot switch to a
   hosted mode; the API refuses both. Such clusters keep their current driver until the hosted
@@ -1324,8 +1403,11 @@ All open questions are decided.
 - Older agents keep using their existing drivers against a newer hub.
 - A `spiffe` Klusterlet in a hosted mode created under a CRD without the install-mode rule is
   refused by a newer klusterlet operator, which deploys no agent for it (see API).
-- An add-on agent built without SPIFFE support cannot run on a cluster that uses the `spiffe`
-  add-on driver; the add-on manager reports this on the `ManagedClusterAddOn`.
+- An add-on that has not declared SPIFFE support cannot run on a cluster that uses the `spiffe`
+  add-on driver, whatever the version of its add-on manager. The registration agent reports this
+  on the `ManagedClusterAddOn`, in `SPIFFEConfigApplied`, because an older add-on manager cannot.
+- `ManagedClusterAddOn` `v1alpha1` clients keep working: `spiffe` is an allowed driver value in
+  both versions.
 - The CloudEvents data types and services are unchanged, so add-on and work payloads are
   compatible across versions.
 
@@ -1354,6 +1436,8 @@ All open questions are decided.
 - 2026-11-25: Closed three ways around the trust-domain pin and the deletion records: a group
   name that no cluster name can produce, pin fields that the gRPC server's cluster service never
   takes from an agent, and a finalizer that is set with the pin and follows the feature gate.
+- 2026-11-25: Had add-ons declare SPIFFE support, gave the registration agent a condition of its
+  own, covered add-on templates, and stated that other add-ons stop when a cluster switches.
 
 ## Drawbacks
 
