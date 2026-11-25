@@ -9,9 +9,11 @@ reviewers:
 approvers:
   - "@kahirokunn"
 creation-date: 2026-11-02
-last-updated: 2026-11-25
+last-updated: 2026-11-26
 status: provisional
 see-also:
   - "/enhancements/sig-architecture/35-work-placement"
   - "/enhancements/sig-architecture/82-addon-template"
   - "/enhancements/sig-architecture/47-manifestwork-updatestrategy"
+  - "/enhancements/sig-architecture/229-manifestworkreplicaset-rollback"
+  - "/enhancements/sig-architecture/231-manifestworkreplicaset-rollout-plugin"

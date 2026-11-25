@@ -62,9 +62,10 @@ Verified against `open-cluster-management-io/api` and `open-cluster-management-i
   customization surface.
 - Delivery is a literal struct copy: `Spec: mwrSet.Spec.ManifestWorkTemplate` in
   `manifestworkreplicaset_deploy_reconcile.go`.
-- The MWRS controller is wired with a `PlacementDecisionInformer` only
-  (`manifestworkreplicaset_controller.go`), and `ClusterDecision` carries just `clusterName`,
-  `reason` and `score`. No `ManagedCluster` attribute is reachable from the controller today.
+- The MWRS controller watches `ManifestWorkReplicaSet`, `ManifestWork`, `Placement` and
+  `PlacementDecision` (`manifestworkreplicaset_controller.go`). None of them carries cluster
+  labels: `ClusterDecision` has just `clusterName`, `reason` and `score`. No `ManagedCluster`
+  attribute is reachable from the controller today.
 
 ### Goals
 
@@ -103,8 +104,9 @@ Verified against `open-cluster-management-io/api` and `open-cluster-management-i
 
 As a platform engineer, I distribute one Deployment to twenty clusters. Each cluster tags its
 application node pool with a `nodepool` label on its `ManagedCluster`. I write one
-`ManifestOverridePolicy` per distinct node pool value. Each MWRS that lists them gets the
-right `nodeSelector` on every cluster, without one copy of the Deployment per node pool.
+`ManifestOverridePolicy` with one override per distinct node pool value. Each MWRS that lists
+it gets the right `nodeSelector` on every cluster, without one copy of the Deployment per node
+pool.
 
 #### Story 2: more replicas in production
 
@@ -114,8 +116,12 @@ template's `replicas: 2` everywhere else, without maintaining two copies of the 
 #### Story 3: a shared override reused by many workloads
 
 As a platform engineer, every workload my team distributes must carry a compliance label and
-tolerate the `dedicated` taint on clusters in `region: eu`. I define that once as a policy,
-and each MWRS lists it by name rather than having the patch pasted into it.
+run with the `eu-critical` `priorityClassName` on clusters in `region: eu`. I define that once
+as a policy, and each MWRS lists it by name rather than having the patch pasted into it.
+
+An earlier draft of this story also added a toleration. That part was removed because no
+patch type can append to `tolerations` on every workload; see the known limitation under
+[Patch application](#patch-application).
 
 #### Story 4: different overrides for different workloads
 
@@ -153,13 +159,11 @@ Namespaced. Applies only to a `ManifestWorkReplicaSet` in the same namespace tha
 //
 // +genclient
 // +kubebuilder:object:root=true
-// +kubebuilder:subresource:status
 type ManifestOverridePolicy struct {
     metav1.TypeMeta   `json:",inline"`
     metav1.ObjectMeta `json:"metadata,omitempty"`
 
-    Spec   ManifestOverridePolicySpec   `json:"spec"`
-    Status ManifestOverridePolicyStatus `json:"status,omitempty"`
+    Spec ManifestOverridePolicySpec `json:"spec"`
 }
 
 // ManifestOverridePolicySpec selects manifests and clusters, and the patches to apply
@@ -185,8 +189,8 @@ type ManifestOverridePolicySpec struct {
 
 // Override applies a list of patches on the clusters matched by ClusterSelector.
 type Override struct {
-    // ClusterSelector selects clusters by ManagedCluster labels. If nil or empty, it
-    // matches every cluster selected by the MWRS placements.
+    // ClusterSelector selects clusters by ManagedCluster labels. An omitted selector and
+    // an empty one ({}) both match every cluster selected by the MWRS placements.
     // +optional
     ClusterSelector *metav1.LabelSelector `json:"clusterSelector,omitempty"`
 
@@ -208,12 +212,15 @@ type Patch struct {
     // is a JSON array, so every JSONPatch would be rejected at admission.
     Patch apiextensionsv1.JSON `json:"patch"`
 
-    // AtomicLists sets what happens when a StrategicMergePatch would replace a list
-    // that is atomic, or whose merge semantics the available schema does not describe.
+    // AtomicValues sets what happens when a StrategicMergePatch would discard a value
+    // it cannot merge into: a list, map or struct that the schema marks atomic, or a
+    // list whose merge semantics the available schema does not describe. It applies
+    // only where the manifest already holds a non-empty value at that path; setting a
+    // value that is absent or empty discards nothing and is always allowed.
     // Ignored for JSONPatch and JSONMergePatch.
     // +kubebuilder:default=Reject
     // +optional
-    AtomicLists AtomicListPolicy `json:"atomicLists,omitempty"`
+    AtomicValues AtomicValuePolicy `json:"atomicValues,omitempty"`
 }
 
 // PatchType is the format of a Patch body.
@@ -229,15 +236,16 @@ const (
     PatchTypeStrategicMergePatch PatchType = "StrategicMergePatch"
 )
 
-// AtomicListPolicy sets how a strategic merge patch treats a list it cannot merge.
+// AtomicValuePolicy sets how a strategic merge patch treats a value it cannot merge
+// into.
 // +kubebuilder:validation:Enum=Reject;Replace
-type AtomicListPolicy string
+type AtomicValuePolicy string
 
 const (
-    // AtomicListReject fails the patch rather than discarding list entries.
-    AtomicListReject AtomicListPolicy = "Reject"
-    // AtomicListReplace replaces the whole list, for users who intend it.
-    AtomicListReplace AtomicListPolicy = "Replace"
+    // AtomicValueReject fails the patch rather than discarding the existing value.
+    AtomicValueReject AtomicValuePolicy = "Reject"
+    // AtomicValueReplace replaces the whole value, for users who intend it.
+    AtomicValueReplace AtomicValuePolicy = "Replace"
 )
 
 // ManifestOverridePolicyList is a list of ManifestOverridePolicy.
@@ -248,31 +256,18 @@ type ManifestOverridePolicyList struct {
 
     Items []ManifestOverridePolicy `json:"items"`
 }
-
-// ManifestOverridePolicyStatus is the observed state of a ManifestOverridePolicy.
-type ManifestOverridePolicyStatus struct {
-    // ObservedGeneration is the generation of the policy that Conditions describe.
-    // +optional
-    ObservedGeneration int64 `json:"observedGeneration,omitempty"`
-
-    // Conditions describe the state of the policy. The known type is Rendered.
-    // +listType=map
-    // +listMapKey=type
-    // +optional
-    Conditions []metav1.Condition `json:"conditions,omitempty"`
-}
-
-const (
-    // ManifestOverridePolicyConditionRendered is True when every render that uses the
-    // policy succeeded, and False with reason RenderFailed when any failed. The message
-    // gives the number of ManifestWorkReplicaSets and clusters affected; details are on
-    // each ManifestWorkReplicaSet.
-    ManifestOverridePolicyConditionRendered string = "Rendered"
-)
 ```
 
-The policy status is a summary for the policy author. The per-cluster detail lives on the
-MWRS, see [Observability](#observability).
+`ManifestOverridePolicy` has no status in alpha. A policy does not render on its own: it is
+rendered once per MWRS and cluster, inside the reconcile of each MWRS that lists it, and each
+of those reconciles sees only its own result. A per-policy condition written from there would
+have many writers and would flip with reconcile order. The outcome is reported where it is
+produced, on the MWRS (see [Observability](#observability)). Whether the policy should carry
+an aggregate is [open question 10](#open-questions).
+
+`clusterSelector` treats an omitted selector and `{}` alike. The implementation has to
+special-case the omitted one, because `metav1.LabelSelectorAsSelector(nil)` returns a selector
+that matches nothing.
 
 #### ResourceOverrideSchema
 
@@ -292,9 +287,9 @@ Different versions of one resource are *not* a conflict. A type served at both `
 `v1beta1` may legitimately carry different list metadata per version, and the manifest's
 `apiVersion` selects which schema applies.
 
-`spec.target.name` and `spec.target.namespace` must be empty — this names a type, not an
-instance. `ResourceIdentifier` carries those fields because `manifestConfigs` needs them;
-here they are rejected by validation rather than silently ignored.
+`spec.target` has only `group` and `resource` — it names a type, not an instance. It is a
+type of its own rather than `ResourceIdentifier`, because `ResourceIdentifier` requires a
+`name` (`manifestConfigs` needs one) and a schema has none to give.
 
 Conflicts are rejected deterministically rather than resolved by picking a winner:
 
@@ -303,7 +298,7 @@ Conflicts are rejected deterministically rather than resolved by picking a winne
 - Any render needing that schema fails for the affected cluster, with an error naming both
   objects and the duplicated key. It does **not** fall back to treating the type as
   schemaless: that would silently downgrade a merge to an atomic replacement, which is the
-  exact failure `atomicLists: Reject` exists to prevent.
+  exact failure `atomicValues: Reject` exists to prevent.
 - Renders that do not touch the contested type are unaffected.
 
 Last-writer-wins and lowest-name-wins were both considered and rejected: either makes the
@@ -333,9 +328,8 @@ type ResourceOverrideSchema struct {
 // ResourceOverrideSchemaSpec names a resource type and describes how its lists merge.
 type ResourceOverrideSchemaSpec struct {
     // Target is the resource type this schema describes, using the same group/resource
-    // identity as ManifestOverridePolicy resourceSelectors. Name and namespace must be
-    // empty: this names a type, not an instance.
-    Target workv1.ResourceIdentifier `json:"target"`
+    // identity as ManifestOverridePolicy resourceSelectors.
+    Target ResourceTypeIdentifier `json:"target"`
 
     // Kind is the manifest kind served for Target. With Version, it gives the hub the
     // kind-to-resource mapping for a type that is installed only on managed clusters,
@@ -351,6 +345,17 @@ type ResourceOverrideSchemaSpec struct {
     // If the hub has the CRD, it is overlaid on the CRD schema; otherwise it is the
     // whole schema. See Effective schema.
     OpenAPIV3Schema apiextensionsv1.JSON `json:"openAPIV3Schema"`
+}
+
+// ResourceTypeIdentifier names a resource type by group and resource.
+type ResourceTypeIdentifier struct {
+    // Group is the API group of the resource. Empty means the core group.
+    // +optional
+    Group string `json:"group"`
+
+    // Resource is the plural resource name, for example "services".
+    // +kubebuilder:validation:MinLength=1
+    Resource string `json:"resource"`
 }
 
 // ResourceOverrideSchemaStatus is the observed state of a ResourceOverrideSchema.
@@ -450,7 +455,7 @@ Kustomize documents, which uses the older `x-kubernetes-patch-strategy` /
 rather than being cosmetic: users will arrive carrying the Kustomize form, and an overlay
 supplying only those markers leaves the list with no effective merge metadata under the
 engine this proposal uses. The list would be treated as atomic, so the merge fails under the
-default `atomicLists: Reject`, or discards existing entries under `Replace`. Neither is
+default `atomicValues: Reject`, or discards existing entries under `Replace`. Neither is
 acceptable as a silent outcome.
 
 `ResourceOverrideSchema` therefore rejects the legacy pair at validation, with an error
@@ -480,7 +485,7 @@ hub may have none, so the resolution order has to be stated rather than assumed:
 Step 3 is the part that matters, because the fallback is not neutral. In the vendored
 `structured-merge-diff` v6, `DeducedParseableType` defines `__untyped_deduced_` with maps
 `separable` and lists `atomic`. So an undescribed map still merges field by field, while an
-**undescribed list is atomic**. Combined with the `atomicLists: Reject` default, a list the
+**undescribed list is atomic**. Combined with the `atomicValues: Reject` default, a list the
 author forgot to describe fails the patch with an error naming the path, rather than
 silently replacing the list. That is the safe direction, and it is why the fallback is
 acceptable for alpha rather than a hole.
@@ -647,18 +652,22 @@ With the gate off:
 - The MWRS controller starts none of the new informers, so a hub that does not use the
   feature does not pay for the `ManagedCluster` cache. It ignores `spec.overridePolicies` and
   renders the plain template.
-- The validating webhook rejects a create or update that adds an entry to
-  `spec.overridePolicies`, or changes one, with an error naming the feature gate. This is the
-  same approach the MWRS webhook already takes for the `ManifestWorkReplicaSet` gate. An update
-  that leaves the existing entries unchanged is allowed, so an MWRS created while the gate was
-  on can still be edited after it is turned off.
+- The MWRS validating webhook rejects a create with a non-empty `spec.overridePolicies`, and an
+  update that adds an entry, with an error naming the feature gate. Put as one rule: the new
+  list must be a subset of the old one. An update that keeps or removes entries is allowed, so
+  an MWRS created while the gate was on can still be edited, and cleaned up, after it is turned
+  off. This is new logic. The existing webhook has no per-field gating: it is not installed at
+  all when the `ManifestWorkReplicaSet` gate is off (`pkg/work/webhook/start.go`), and its only
+  gate check rejects every request.
+- The controller removes the `OverridesRendered` condition and the `override-policies`
+  annotation wherever they are still set, since it no longer renders overrides.
 - The validating webhooks for `ManifestOverridePolicy` and `ResourceOverrideSchema` are not
   registered, and the objects have no effect.
 
-#### A single renderer, used by all three call sites
+#### A single renderer, used by every call site
 
-This is a correctness constraint, not a preference. The template is copied in three places in
-the MWRS controller, and two of them are drift detection:
+This is a correctness constraint, not a preference. It covers every place that copies the
+template. Today the MWRS controller has three, and two of them are drift detection:
 
 | Site | Purpose |
 |---|---|
@@ -671,7 +680,7 @@ un-rendered template against a rendered live object. They would never agree. The
 would stay `ToApply`, `Progressive` rollout would keep selecting the same clusters,
 `PlacementRolledOut` would never reach `Complete`, and the status counts would be wrong.
 
-All three sites must therefore route through one function:
+Every such site must therefore route through one function:
 
 ```go
 // Render returns the ManifestWorkSpec for one cluster: template with the patches of
@@ -702,6 +711,12 @@ enhancement, which will evaluate CEL against the cluster object, does not need a
 signature. It returns an error of type `*RenderError`, which carries the policy, manifest,
 override and patch index of the failure.
 
+The two comparison sites also need a candidate whose metadata comes from the render, not from
+the live object. Today both copy the live `ManifestWork`'s `ObjectMeta` into the candidate
+before calling `ManifestWorkEqual`, so labels and annotations always compare equal and only
+the spec is checked. That stops being enough once the controller writes the `override-policies`
+annotation; the comparison rule is given under [Observability](#observability).
+
 A prototype with unit tests for the scenarios in [#198][issue-198] is in
 [ocm#1792][ocm-1792]. It still uses the earlier signature and will be updated to match.
 
@@ -721,22 +736,42 @@ ordered, two renders of the same inputs always produce the same bytes.
 `resourceSelectors` reuses `ManifestWork`'s existing `ResourceIdentifier`
 (group / resource / namespace / name), the same type `manifestConfigs` uses, with the same
 `"*"` wildcard support for name and namespace. This keeps one resource-addressing concept in
-the work API and lets the implementation reuse `helper.ResourceMatch`.
+the work API and lets the implementation reuse the matching that `manifestConfigs` already
+has. That is `resourceMatch` in `pkg/work/helper`, which is unexported today and has to be
+exported or moved.
 
 This requires mapping each manifest's `apiVersion`/`kind` to its resource, which the work hub
 does not do today — it needs a `RESTMapper`. A `RESTMapper` built from hub discovery covers
 built-in types and any CRD installed on the hub. For a type installed only on managed
 clusters, the mapping comes from the `kind`/`version`/`target` triple on its
-`ResourceOverrideSchema`, as described above. A manifest whose type can be resolved by
-neither route and which no selector matches is simply left unpatched; if a selector does
-name an unresolvable group/resource, the render fails for that cluster with an error naming
-the type, rather than silently skipping the manifest.
+`ResourceOverrideSchema`, as described above.
+
+A manifest whose type neither route can resolve has no resource name to match against, but
+its group is still known from its `apiVersion`. The rule uses that:
+
+- If no selector names the manifest's group, the manifest cannot be a target and is left
+  unpatched.
+- If a selector does name its group, the render fails for that cluster. The controller cannot
+  tell whether the selector was meant to match the manifest, and skipping it would drop an
+  override silently. The error names the manifest's `apiVersion` and `kind`, and says that a
+  `ResourceOverrideSchema` for that version, or the CRD on the hub, is missing.
+
+Only the selectors of policies that have an override matching the cluster are considered,
+since the others contribute no patch there.
+
+The check starts from the manifests in the template, not from the selectors. A selector that
+names a type the template does not contain is never an error: a shared policy legitimately
+selects types that a given MWRS does not ship. So deleting the Knative
+`ResourceOverrideSchema` fails the MWRS whose template holds a `serving.knative.dev` manifest,
+and leaves alone the ones that list the same policy but ship only Deployments.
 
 #### Patch application
 
 - **JSONPatch** — RFC 6902, via `github.com/evanphx/json-patch/v5`. v5 is used deliberately:
   v4 lets `replace` on a missing field succeed silently, v5 returns an error. `sdk-go`
-  already uses v5.
+  already uses v5. Patches are applied with the library's default options, in which
+  `EnsurePathExistsOnAdd` and `AllowMissingPathOnRemove` are both off: an `add` never creates
+  a missing parent, and a `remove` of a missing path is an error.
 - **JSONMergePatch** — RFC 7386.
 - **StrategicMergePatch** — for built-in types the merge keys come from the Go types in
   `client-go`'s scheme. For custom resources they come from the type's CRD schema, overlaid
@@ -751,9 +786,61 @@ not read; handing it a CRD schema is not sufficient on its own. A composite
 `x-kubernetes-list-map-keys` must be honoured in full and must never be silently reduced to
 its first field.
 
-When the available schema cannot support the requested merge — an atomic list, or a map list
-whose keys cannot be honoured — the patch fails rather than silently replacing the list,
-unless the patch sets `atomicLists: Replace`.
+**What the result is defined as.** The two engines do not agree everywhere, so this proposal
+states what each one promises instead of claiming they are the same.
+
+- For a built-in type, a patch that is applied gives the result the Kubernetes API server's
+  own strategic merge patch gives for the same patch on the same object. It is computed by
+  the same library from the same Go types.
+- For a custom resource, which the API server does not accept strategic merge patches for at
+  all, the result is defined by the structural markers in the
+  [effective schema](#effective-schema).
+
+The same patch can therefore merge differently when a custom resource embeds a structure that
+a built-in type also has. The known cases:
+
+| Field | Built-in (`strategicpatch`) | Custom resource (typed merge) |
+| --- | --- | --- |
+| `containers[].ports` | merged by `containerPort` | merged by `containerPort` and `protocol`, when the schema declares both |
+| `Service` `spec.ports` | merged by `port` | merged by `port` and `protocol`, when the schema declares both |
+| `topologySpreadConstraints` | merged by `topologyKey` | merged by `topologyKey` and `whenUnsatisfiable`, when the schema declares both |
+| `nodeSelector` and other maps marked atomic | merged key by key | one value, replaced as a whole |
+
+In the first three rows, a patch entry that shares the first key with an existing entry and
+differs in the second overwrites that entry on a built-in, and is added next to it on a custom
+resource. Neither is an error. The last row is covered by `atomicValues`, below. An author who
+needs one exact outcome on every type should use a JSON Patch. Whether to run built-ins
+through the typed merge as well, which would remove the table, is
+[open question 9](#open-questions).
+
+**Values that cannot be merged into.** When a strategic merge patch would discard a value it
+cannot merge into, the patch fails rather than silently replacing the value, unless the patch
+sets `atomicValues: Replace`. This covers:
+
+- a list the schema marks atomic, or a map list whose keys cannot be honoured;
+- on the custom resource path, a map or struct the schema marks atomic
+  (`x-kubernetes-map-type: atomic`). `structured-merge-diff` treats these as one value, just
+  as it does an atomic list, and `MutatingAdmissionPolicy` refuses to mutate all three for the
+  same reason. On the built-in path there is nothing to guard, because `strategicpatch` merges
+  every map key by key.
+
+The check applies only where the manifest already holds a non-empty value at that path.
+Setting a value that is absent or empty discards nothing, so it is allowed under `Reject`.
+The outcome can then differ between two workloads that list the same policy, when one has the
+field and the other does not. The one that would lose data fails with an error naming the
+path, which is what the default is for.
+
+**Known limitation: appending to an atomic list.** `tolerations` is an atomic list with no
+merge key, on built-ins and custom resources alike. A strategic merge patch or a JSON Merge
+Patch can only set it as a whole, which drops the workload's own tolerations if it has any. A
+JSON Patch `add` to `/spec/template/spec/tolerations/-` appends, but fails when the template
+has no `tolerations` field, because `add` does not create the parent. So "append this entry,
+creating the list if needed" cannot be written as one patch that works on every workload,
+which is what a shared policy needs. Alpha does not solve this. A template that declares
+`tolerations: []` makes the `add` form work, at the cost of touching every template. Turning
+on `EnsurePathExistsOnAdd` would also work, but it makes `add` succeed where RFC 6902 says it
+fails, and strictness is the reason v5 was chosen. It is recorded here so that it is a known
+gap, not a surprise.
 
 **Deletion semantics must not diverge between built-ins and custom resources.** This is a
 trap in the approach above. A strategic merge patch deletes a field by setting it to `null`,
@@ -772,6 +859,17 @@ honoured for a custom resource is an error naming the directive and the path, ne
 silent no-op. The test plan covers deletion on both a built-in and a custom resource with
 the same patch body, asserting identical results.
 
+**A `null` can be lost before the renderer sees it.** The patch body is stored in a custom
+resource, and how the policy is written to the API decides whether a `null` in it is stored.
+A create keeps it. An update of the policy that is sent as a merge patch does not: in a merge
+patch `null` means "remove this key", so client-side `kubectl apply`, `kubectl edit` and
+`kubectl patch --type=merge` drop a newly added `null` instead of storing it. The policy then
+renders without the deletion, and nothing reports an error, because the stored policy is
+valid. Deletions should therefore be written in a form that does not depend on `null`: a JSON
+Patch `remove`, or `$patch: delete` in a strategic merge patch. The renderer still honours a
+`null` that is present in the stored policy, and the test plan covers which write paths keep
+one.
+
 #### Identity invariant
 
 After all patches are applied, the rendered manifest's `apiVersion`, `kind`, `name` and
@@ -783,9 +881,10 @@ resource, and make `ManifestWork` status accounting meaningless.
 
 The MWRS controller gains four informers:
 
-- `ManifestOverridePolicy`, to re-render when a policy changes. The informer has an index
-  from policy to the MWRS that list it in `spec.overridePolicies`, so a policy change
-  enqueues only those MWRS instead of every MWRS in the namespace.
+- `ManifestOverridePolicy`, to re-render when a policy changes. An index on the MWRS informer,
+  keyed by the policies each MWRS lists in `spec.overridePolicies`, lets a policy change
+  enqueue only those MWRS instead of every MWRS in the namespace. It has the same shape as the
+  existing `manifestWorkReplicaSetByPlacement` index.
 - `ManagedCluster`, because label selectors need cluster labels, which `PlacementDecision`
   does not carry.
 - `ResourceOverrideSchema`, on create, update **and delete**. Merge metadata is an input to
@@ -793,51 +892,110 @@ The MWRS controller gains four informers:
   watch, existing `ManifestWork`s keep the payload rendered under the old metadata until some
   unrelated event happens to reconcile their MWRS, which is both wrong and hard to diagnose.
   Deletion matters as much as update: removing a schema can turn a previously valid merge
-  into one that must now fail under `atomicLists: Reject`.
+  into one that must now fail under `atomicValues: Reject`.
 - `CustomResourceDefinition` on the hub, because a hub CRD is an input in two ways:
   - **Resource mapping, for every patch type.** The hub `RESTMapper` resolves
     `resourceSelectors` through hub CRDs (see [Resource selection](#resource-selection)), so
     creating or deleting a CRD, or changing the versions it serves, changes which manifests a
-    selector matches. Without this, a render that failed on an unresolvable selector is never
+    selector matches. Without this, a render that failed on an unresolvable type is never
     retried once the CRD is installed, and a deleted CRD leaves the old render in place.
   - **Effective schema, for strategic merge.** The hub CRD is the base of the
     [effective schema](#effective-schema), so a schema change such as a list moving from `map`
     to `atomic` changes the merge result.
 
-  An index from group and resource to the MWRS whose listed policies select that type keeps
-  unrelated CRD churn from enqueuing anything. On create, delete, or a change to served
-  versions, every MWRS in the index is enqueued and the `RESTMapper` is reset. An update that
-  changes only the schema enqueues just the MWRS whose policies carry a strategic merge patch
-  for that type. Other updates are dropped.
+  Unrelated CRD churn must not enqueue anything, so a CRD event is mapped to MWRS through the
+  policies. Which MWRS care about a group and resource depends on what their policies select,
+  so this cannot be one informer index. It is two lookups: an index on the policy informer
+  from group and resource to the policies whose selectors name it, then the MWRS index above
+  from those policies to the MWRS that list them. `ResourceOverrideSchema` events use the same
+  two lookups.
+
+  A newly created CRD is not in discovery until its `Established` condition turns `True`, and
+  that arrives as a status-only update. So the trigger is the condition, not the create event.
+  When `Established` or `NamesAccepted` changes, when the CRD is deleted, or when its served
+  versions change, the `RESTMapper` is reset and every MWRS found by the lookup is enqueued.
+  An update that changes only the schema enqueues just the MWRS whose policies carry a
+  strategic merge patch for that type. Other updates are dropped.
+
+  Discovery is the one input that is not an informer, and it can lag the condition briefly. A
+  render that failed because a type could not be resolved is therefore requeued with backoff.
+  No other render failure is retried on a timer: every other input is watched, and rendering
+  unchanged inputs again gives the same error.
 
 The `ManagedCluster` informer is the significant cost. It caches every `ManagedCluster` on the
 hub and must re-render affected MWRS when labels change. Mitigations to measure before
 committing: an informer `transform` that drops `managedFields` and `status`, and event
-filtering so that only label changes enqueue work. See
-[Risks and Mitigation](#risks-and-mitigation).
+filtering so that only an add, a delete or a label change enqueues work. Add and delete have
+to stay: a selected cluster whose `ManagedCluster` is not in the cache is a render failure
+(see [Failure handling](#failure-handling)), and it has to be rendered again when the object
+appears. Dropping `status` is safe only while selection reads labels alone. `Render` is given
+the whole object so that templating can read more of it later, and the transform has to be
+revisited when that lands. See [Risks and Mitigation](#risks-and-mitigation).
 
 #### Failure handling
 
-A render failure affects one cluster. The implementation:
+A render failure belongs to one cluster. For that cluster the implementation:
 
-- does not create or update that cluster's `ManifestWork`;
-- reports the cluster to the rollout machinery as `Failed`, not as `ToApply`. This matters:
-  a cluster stuck in `ToApply` never counts toward `maxFailures` and a `Progressive` rollout
-  with a `progressDeadline` would stall instead of failing;
+- does not create or update the `ManifestWork`. An existing one is left as it is;
+- reports the cluster to the rollout machinery as `TimeOut`, so that it counts toward
+  `maxFailures` at once (the reasoning is below);
+- does not count the cluster as up to date, so `PlacementRolledOut` cannot become `Complete`
+  while a selected cluster fails to render;
 - sets the MWRS `OverridesRendered` condition to `False` with reason `RenderFailed` (see
   [Observability](#observability)), so a failure anywhere is visible without inspecting each
   cluster;
 - includes the offending policy, manifest index, override index and patch index in the
   message. The prototype's `RenderError` already carries exactly these.
 
-Clusters whose render succeeded are unaffected.
+**Why `TimeOut`.** The other two statuses each fail in a different way. A cluster left in
+`ToApply` never counts toward `maxFailures`, so the rollout stalls without saying why.
+`Failed` counts, but the rollout handler then measures `progressDeadline` from the status's
+`LastTransitionTime`, and the controller takes that time from `ManifestWork` conditions. A
+render failure writes no work, so there is no such time: the deadline would start again on
+every reconcile and the cluster would hold a `maxConcurrency` slot for good. There is also
+nothing to wait for: a render gives the same result until one of its inputs changes, and
+every input change triggers a new render. `TimeOut` is the status the handler gives a cluster
+once its deadline has passed, and the handler accepts it as input. It counts toward
+`maxFailures`, holds no slot, and needs no per-cluster timestamp to be stored.
 
-A listed policy that does not exist is different, because it affects every cluster of the
-MWRS rather than one. The MWRS `OverridesRendered` condition is set to `False` with reason
-`OverridePolicyNotFound` naming the policy, and its existing `ManifestWork`s are left as they are rather than rewritten to
-the template without that policy. Rendering resumes when the policy is created or the
-reference is removed. Leaving the works alone is the safer direction: if a policy is deleted
-by mistake, the workload keeps running as it was.
+**What is isolated, and what is not.** Rendering is isolated per cluster: one cluster's
+failure never changes the payload rendered for another. Whether the rollout carries on is the
+rollout strategy's decision, as it is for a cluster whose workload fails:
+
+- `All` carries on to every other cluster.
+- `Progressive` and `ProgressivePerGroup` count the failed cluster toward `maxFailures`, which
+  defaults to 0. With the default, one render failure stops the rollout from reaching further
+  clusters until it is fixed. Clusters that already have the new payload keep it.
+
+This is what surfacing failures to the rollout machinery means in practice: a policy edit
+that breaks one cluster halts a progressive rollout the same way a bad image would.
+
+**What keeps running.** Work that does not depend on a render is not held back by a failure:
+deleting the `ManifestWork`s of clusters the placement no longer selects, of placements
+removed from the spec, and of duplicates; the finalizer when the MWRS is deleted; and status
+accounting over the existing `ManifestWork`s. While `OverridesRendered` is `False`,
+`ManifestworkApplied` is `NotAsExpected` with the same message, so the clusters that did
+render cannot report overall success. The controller already does this when a `Placement` is
+missing.
+
+Two cases use the same path, and differ only in how many clusters they affect.
+
+**A listed policy that does not exist** fails the render for every selected cluster, since
+none of them can be rendered without it. `OverridesRendered` is `False` with reason
+`OverridePolicyNotFound` naming the policy. Everything above then follows: existing
+`ManifestWork`s are left as they are rather than rewritten to the template without that
+policy, a newly selected cluster gets no `ManifestWork`, the works of clusters that are no
+longer selected are still deleted, and `PlacementRolledOut` stays `Progressing` with a message
+naming the policy. Rendering resumes when the policy is created or the reference is removed.
+Leaving the works alone is the safer direction: if a policy is deleted by mistake, the
+workload keeps running as it was. It is also what the controller does today for a missing
+`Placement`, whose works it retains while the conditions say why.
+
+**A selected cluster with no `ManagedCluster` in the cache** fails the render for that
+cluster. It is not rendered as a cluster with no labels, which would rewrite its
+`ManifestWork` to a payload without the overrides its labels would have selected. This
+happens when a `ManagedCluster` is deleted while a `PlacementDecision` still lists it, and it
+ends when the placement drops the cluster and the work is deleted in the normal way.
 
 #### Observability
 
@@ -861,10 +1019,22 @@ are enough because policies are in the MWRS namespace.
 
 An annotation rather than a status field, because `ManifestWork` status is written by the work
 agent, while the hub controller owns the object's spec and metadata. It already sets the
-`work.open-cluster-management.io/manifestworkreplicaset-owner` annotation the same way. The
-annotation is part of the rendered object, so `ManifestWorkEqual` compares it like any other
-annotation: when the set of applied policies changes, the `ManifestWork` is updated, and when
-it becomes empty the annotation is removed.
+`work.open-cluster-management.io/manifestworkreplicaset-owner` annotation the same way.
+
+The annotation has to change whenever the set of applied policies changes, including when the
+rendered spec does not. That happens: if `prod` is removed from an MWRS that also lists
+`prod-hotfix`, and `prod-hotfix` already overrode every field `prod` set, the spec is
+identical and only the provenance differs. `ManifestWorkEqual` does not detect this on its
+own, for two reasons. The two drift-detection sites copy the live object's `ObjectMeta` into
+the candidate, so its annotations always match. And the annotation check inside
+`ManifestWorkEqual` only asks whether the wanted keys are present with the wanted values, so
+a key that should be removed is never a difference.
+
+The implementation therefore compares this one key exactly, at both drift-detection sites
+and in the apply path: it must be absent when no policy applied, and equal to the rendered
+value otherwise. A provenance-only change is applied like any other update. It does not
+change the `ManifestWork`'s generation, so the cluster returns to its previous rollout status
+on the next reconcile.
 
 **On the MWRS: one condition.**
 
@@ -900,14 +1070,40 @@ failed clusters sorted by name, each with its `RenderError`:
 ```
 
 This answers "is anything failing?" from the MWRS alone, as asked on [#198][issue-198]. The
-condition is not set on an MWRS that lists no policies, so the status of existing MWRS does
-not change on upgrade.
+condition exists only while the controller renders overrides for the MWRS. It is not set on
+an MWRS that lists no policies, so the status of existing MWRS does not change on upgrade. It
+is removed when `spec.overridePolicies` becomes empty or the feature gate is turned off, so a
+stale `False` cannot outlive what it describes.
+
+#### Interaction with rollback and rollout plugins
+
+Two implementable proposals change the same reconcile: [MWRS rollback][enh-229] and
+[MWRS rollout plugins][enh-231]. Neither is implemented at the time of writing, so this
+states how the pieces have to fit, not what the code does.
+
+- **A revision is a template revision.** Rollback identifies a revision by a hash of
+  `.spec.manifestWorkTemplate`. That stays as it is. Editing a policy, or changing
+  `spec.overridePolicies`, creates no revision. The policies are applied, as they are at
+  render time, on top of whichever template revision is being delivered.
+- **Abort goes through `Render`.** Rollback's abort path applies the template stored in a
+  `ControllerRevision` to the affected clusters at once. That is one more place that copies
+  the template, so the single-renderer rule above binds it. Applying the stored template
+  directly would strip every override from those clusters in one step.
+- **An abort cannot undo a policy edit.** A render failure counts toward `maxFailures`, so
+  with `failureStrategy: AbortAll` it can trigger an abort. The abort renders the previous
+  template with the current policies. If the failure came from the new template, that fixes
+  it. If it came from a policy, the same render fails again and those clusters keep the
+  `ManifestWork` they have, as for any render failure. Reverting a policy is done by editing
+  the policy.
+- **Plugins see the rendered work.** The plugin hook `MutateManifestWork()` runs before a
+  `ManifestWork` is applied. Overrides are rendered first, and the plugin receives the
+  rendered object.
 
 ### Risks and Mitigation
 
 - **`ManagedCluster` informer cost.** Memory grows with fleet size and label churn triggers
   re-render. Needs measurement at realistic fleet scale before this graduates. Mitigated by an
-  informer `transform` and label-only event filtering.
+  informer `transform` and event filtering.
 - **One policy edit changes many workloads.** A shared policy is listed by many MWRS, so
   editing it re-renders all of them. This is the point of sharing, but the blast radius is
   real. Mitigated by policies being namespaced, by provenance on each `ManifestWork`, and by
@@ -917,9 +1113,14 @@ not change on upgrade.
   added or enforced automatically can use Kubernetes admission (for example a
   `MutatingAdmissionPolicy`) or their GitOps tooling until OCM support is decided in open
   question 8.
-- **Silent data loss through list replacement.** The reason `atomicLists` defaults to
-  `Reject`. Replacing a container list and losing a sidecar is the kind of failure that is
-  discovered in production.
+- **Silent data loss through replacement.** The reason `atomicValues` defaults to `Reject`.
+  Replacing a container list and losing a sidecar, or a `nodeSelector` and losing its other
+  keys, is the kind of failure that is discovered in production.
+- **One strategic merge patch, two results.** A custom resource that embeds a structure a
+  built-in also has can merge it differently, because the two types go through different
+  engines. Mitigated by defining what each engine promises, listing the known differences
+  under [Patch application](#patch-application), and pinning each with a test. Removing the
+  difference is open question 9.
 - **Two overlapping customisation mechanisms.** If templating lands later, users will have
   patches and templates to choose between, with a permanent documentation cost. Keeping
   templating out of this proposal limits the combined surface for now, but the interaction
@@ -962,8 +1163,9 @@ not change on upgrade.
    manual registration as the permanent answer, and neither design blocks the other. See
    [Graduation Criteria](#graduation-criteria).
 
-2. ~~**One identifier scheme or two?**~~ **Resolved.** `ResourceIdentifier` (group/resource)
-   is used throughout — `resourceSelectors` and `ResourceOverrideSchema.spec.target` — per
+2. ~~**One identifier scheme or two?**~~ **Resolved.** Group/resource identity is used
+   throughout — `resourceSelectors` as `ResourceIdentifier`, and
+   `ResourceOverrideSchema.spec.target` as the same group and resource without a name — per
    @kahirokunn on [#198][issue-198] and review feedback on [#155][pr-155]. The objection
    that group/resource needs hub discovery for types the hub does not have installed is
    answered by `ResourceOverrideSchema` carrying `kind` and `version`, so registering a
@@ -1021,52 +1223,91 @@ not change on upgrade.
 
    Until then, Kubernetes admission or GitOps tooling can cover both.
 
+9. **One merge engine for built-ins and custom resources?** Alpha uses `strategicpatch` for
+   built-in types and typed merge for custom resources, and
+   [Patch application](#patch-application) lists where the two differ. Running built-ins
+   through the typed merge too, with their schema read from the hub's OpenAPI, would make one
+   patch mean one thing on every type. The costs: the hub's OpenAPI becomes an input that has
+   to be fetched and refreshed, every strategic merge directive has to be reimplemented on
+   the typed path, and a built-in would no longer merge the way `kubectl patch` merges it. To
+   be decided before beta, with the divergence tests as evidence of how often it matters.
+
+10. **Should a policy carry status?** An earlier draft gave `ManifestOverridePolicy` a
+    `Rendered` condition summarising every render that used it. It was removed because nothing
+    could write it correctly: renders happen inside per-MWRS reconciles, and an aggregate
+    needs a single writer and per-cluster results stored in a structured form, which the MWRS
+    condition message is not. If field experience shows that policy authors need "is my policy
+    failing anywhere?" answered on the policy itself, that takes a per-policy reconcile and a
+    stored result, designed together.
+
 ### Test Plan
 
 **Unit tests** on the renderer, which is pure and the natural place for most coverage:
 each patch type; ordering across priority, overrides and patches; wildcard and non-matching
-resource selectors; cluster selectors that match, do not match, and are empty; the identity
-invariant; atomic-list reject and the explicit `Replace` opt-in; composite
+resource selectors; an unresolvable manifest whose group a selector names, asserting a failure
+that names the manifest, one whose group no selector names, asserting it is left unpatched,
+and a selector naming a type the template does not contain, asserting no failure; cluster
+selectors that match, do not match, are empty, and are omitted, asserting that the last two
+both match every cluster; the identity invariant; JSON Patch `add` under a missing parent and
+`remove` of a missing path, asserting errors; rejection of a discarded atomic list, map and
+struct, the explicit `Replace` opt-in, and an atomic value set where the manifest has none or
+an empty one, asserting it is allowed under `Reject`; composite
 `x-kubernetes-list-map-keys`; `ResourceOverrideSchema` overlay precedence over the CRD schema;
 two schemas sharing a uniqueness key, asserting that the render fails naming both rather than
 picking one, and that a second schema differing only in `spec.version` is accepted; an overlay
 carrying the legacy `x-kubernetes-patch-strategy` pair, asserting a validation error that
 names the structural equivalent rather than a silently atomic list; a managed-cluster-only
 type whose registered schema omits a list the patch touches, asserting that the deduced
-fallback makes it atomic and that `atomicLists: Reject` therefore fails with the path named,
+fallback makes it atomic and that `atomicValues: Reject` therefore fails with the path named,
 rather than replacing the list; determinism, by rendering
 twice and comparing bytes. [ocm#1792][ocm-1792] already carries this suite for the agreed
 subset.
 
-Two cases deserve naming because they guard against silent divergence rather than an
+Four cases deserve naming because they guard against silent divergence rather than an
 outright bug. **Deletion parity**: the same strategic merge patch using `null` and
 `$patch: delete` is applied to a built-in and to a custom resource, and the two results must
 agree — this is the gap between `strategicpatch` and typed merge described above. **JSON
 Patch body shape**: a policy whose `patch` is a JSON array round-trips through the CRD
-schema, which is what `apiextensionsv1.JSON` buys over `runtime.RawExtension`.
+schema, which is what `apiextensionsv1.JSON` buys over `runtime.RawExtension`. **Documented
+divergence**: each row of the table under [Patch application](#patch-application) is applied
+to a built-in and to a custom resource, and both results are asserted, so a change in either
+engine shows up as a test failure and not as a changed payload. **`null` round trip**: a
+policy whose patch contains a `null` is created, then updated by client-side apply, by
+server-side apply and by replace, recording which write paths keep the `null`.
 
 **Integration tests** on the controller: that a policy change re-renders existing
 `ManifestWork`s; that the two drift-detection sites agree with the rendered object, so no
 churn occurs — a regression test for the failure mode described above; that a render failure
-marks one cluster `Failed` and leaves others untouched; that a `Progressive` rollout with
-`maxFailures` and `progressDeadline` reacts to a failing cluster instead of stalling; that
+leaves that cluster's `ManifestWork` unchanged and does not change the payload rendered for
+any other cluster; that under `All` the other clusters still receive the new payload; that
+under `Progressive` a render-failed cluster counts toward `maxFailures` at once, does not hold
+a `maxConcurrency` slot, and with the default `maxFailures` stops the rollout from reaching
+further clusters; that a selected cluster with no `ManagedCluster` fails to render instead of
+rendering without labels; that
 `ManagedCluster` label changes re-render; that creating, editing and deleting a
 `ResourceOverrideSchema` re-renders the `ManifestWork`s whose merge result it changes; that
 a hub CRD whose list changes from `map` to `atomic` re-renders the affected MWRS and fails
-under `atomicLists: Reject`, while a change to an unrelated CRD enqueues nothing; that
-installing a hub CRD retries a JSON Patch render that failed on an unresolvable selector, and
-deleting it re-renders the MWRS; that
+under `atomicValues: Reject`, while a change to an unrelated CRD enqueues nothing; that
+a hub CRD becoming `Established` retries a JSON Patch render that failed on an unresolvable
+type, and deleting it re-renders the MWRS; that
 an MWRS is patched only by the policies it lists, while a sibling MWRS in the same
 namespace that does not list the policy renders the plain template; that removing a reference
 re-renders without that policy; that the `override-policies` annotation lists the applied
-policies in order and is removed when none apply; that `OverridesRendered` is `False` with
-`RenderFailed` when one cluster fails and `True` again once it renders; that a missing referenced policy sets
-`OverridePolicyNotFound` and leaves the existing `ManifestWork`s unchanged.
+policies in order and is removed when none apply; that removing a policy whose fields a later
+policy already overrode, so that the rendered spec is unchanged, still updates the annotation
+— a regression test for the comparison rule under [Observability](#observability); that
+`OverridesRendered` is `False` with `RenderFailed` when one cluster fails and `True` again
+once it renders, that `ManifestworkApplied` is `NotAsExpected` meanwhile, and that the
+condition is removed when the list is emptied; that a missing referenced policy sets
+`OverridePolicyNotFound`, leaves the existing `ManifestWork`s unchanged, still deletes the
+work of a cluster the placement dropped, creates none for a newly selected cluster, and
+reports `PlacementRolledOut` as `Progressing`.
 
 **Webhook tests**: duplicate names in `overridePolicies` are rejected, and a name that does
 not exist yet is accepted. With the `ManifestOverridePolicy` gate off, the validating webhook
-rejects adding or changing an `overridePolicies` entry but allows other edits to an
-MWRS that already has entries.
+rejects a create with entries and an update that adds one, and allows an update that keeps or
+removes entries. A `ResourceOverrideSchema` whose `target` has only `group` and `resource`,
+as in the example, is accepted.
 
 **E2E tests**: a `ManifestWorkReplicaSet` plus a `ManifestOverridePolicy` producing different
 payloads on two managed clusters, including a custom resource patched with a registered
@@ -1081,7 +1322,8 @@ realistic fleet size, with and without the informer `transform`, before graduati
 
 - `ManifestOverridePolicy` served at `v1alpha1` behind the `ManifestOverridePolicy` feature
   gate, off by default (see [Feature gate](#feature-gate)).
-- Renderer used by all three MWRS call sites; unit and integration tests above passing.
+- Renderer used by every MWRS site that copies the template; unit and integration tests above
+  passing.
 - Per-cluster failure reporting and provenance implemented.
 - `ResourceOverrideSchema` and custom-resource strategic merge implemented, backed by
   explicitly registered schemas (open question 1, option a).
@@ -1093,6 +1335,7 @@ realistic fleet size, with and without the informer `transform`, before graduati
   `ResourceOverrideSchema` registration remains available as an override.
 - E2E coverage on a real multi-cluster setup.
 - Scale measurements published for the `ManagedCluster` informer.
+- Decisions on open questions 9 (one merge engine) and 10 (policy status).
 - Feature gate on by default.
 
 #### GA
@@ -1110,9 +1353,12 @@ a policy on an MWRS.
 
 On downgrade, or if the feature gate is turned off, rendering reverts to the plain template;
 the next reconcile rewrites each `ManifestWork` back to the un-overridden payload, which is a
-real workload change and must be documented. Removing the references before downgrading
-produces the same result through the normal reconcile path, with rollout strategies applied,
-and is the recommended procedure.
+real workload change and must be documented. With the gate off, the same reconcile removes
+the `override-policies` annotation and the `OverridesRendered` condition. A downgrade to a
+release without the feature leaves the annotation on existing `ManifestWork`s, because the
+older controller does not know the key; it is stale but harmless. Removing the references
+before downgrading produces the same result through the normal reconcile path, with rollout
+strategies applied, and is the recommended procedure.
 
 Downgrade also drops `overridePolicies` from stored objects, so
 re-enabling the feature after a downgrade does not bring the references back. Users must
@@ -1121,9 +1367,9 @@ re-apply them, which is one more reason to remove them deliberately first.
 ### Version Skew Strategy
 
 Rendering happens entirely on the hub, and the agent receives an ordinary `ManifestWork`. An
-`n-2` klusterlet that knows nothing about this feature is unaffected. If option (c) in open
-question 1 is adopted later, that will introduce a genuine hub/agent contract and will need
-its own skew analysis.
+`n-2` klusterlet that knows nothing about this feature is unaffected. Option (c) in open
+question 1, which gates beta, will introduce a genuine hub/agent contract and will need its
+own skew analysis.
 
 ## Implementation History
 
@@ -1163,6 +1409,20 @@ its own skew analysis.
   @kahirokunn agrees and decides to keep alpha declarative. `default`, `disabled` and the
   mutating webhook are removed; MWRS apply exactly the policies they list. Default and
   required policies become open question 8.
+- 2026-11-26: review against `api`, `ocm` and `sdk-go` at `main`.
+  - Statements about current code corrected: the controller's informers, the gate-off
+    webhook, `resourceMatch`, and what `ManifestWorkEqual` compares. The `override-policies`
+    annotation is compared exactly.
+  - A render failure is reported to the rollout as `TimeOut`, and its effect under each
+    rollout strategy is stated. A missing policy and a missing `ManagedCluster` use the same
+    path.
+  - `ResourceOverrideSchema.spec.target` gets a group/resource-only type. The `atomicLists`
+    field becomes `atomicValues` and covers atomic maps and structs. The unresolvable-type
+    rule is restated from the manifest's group.
+  - Known differences between the two merge engines, the `tolerations` limitation and the
+    loss of `null` on merge-patch updates are documented. Story 3 no longer adds a toleration.
+  - The policy `Rendered` condition is removed (open question 10). The hub CRD trigger moves
+    to the `Established` condition. Interaction with rollback and rollout plugins added.
 
 ## Drawbacks
 
@@ -1203,8 +1463,8 @@ keyed by placement. Fields on an API that is still `v1alpha1`.
 *Against:* overrides cannot be shared across `ManifestWorkReplicaSet`s; the same patch has
 to be copied into each one.
 
-This alternative was not chosen because of the sharing and governance arguments, even though
-it is materially cheaper. @kahirokunn, as approver, confirmed the separate resource on
+This alternative was not chosen because of the sharing argument, even though it is materially
+cheaper. @kahirokunn, as approver, confirmed the separate resource on
 [#202][pr-202-kahirokunn].
 
 ### Implicit application with an `overrideMode` opt-out
@@ -1248,6 +1508,8 @@ feature gate is enabled by default.
 - [enhancements#155 — Add proposal for cluster set level override in MWRS][pr-155]
 - [ocm#1175 — the originating request][ocm-1175]
 - [ocm#1792 — renderer prototype][ocm-1792]
+- [Support Rollback for ManifestWorkReplicaSet][enh-229]
+- [ManifestWorkReplicaSet Rollout Plugin][enh-231]
 - [Karmada OverridePolicy](https://karmada.io/docs/userguide/scheduling/override-policy/)
 - [Kustomize custom OpenAPI schema][kustomize-openapi]
 
@@ -1259,4 +1521,6 @@ feature gate is enabled by default.
 [pr-155]: https://github.com/open-cluster-management-io/enhancements/pull/155
 [ocm-1175]: https://github.com/open-cluster-management-io/ocm/issues/1175
 [ocm-1792]: https://github.com/open-cluster-management-io/ocm/pull/1792
+[enh-229]: ../229-manifestworkreplicaset-rollback/README.md
+[enh-231]: ../231-manifestworkreplicaset-rollout-plugin/README.md
 [kustomize-openapi]: https://github.com/kubernetes-sigs/kustomize/blob/master/examples/customOpenAPIschema.md
