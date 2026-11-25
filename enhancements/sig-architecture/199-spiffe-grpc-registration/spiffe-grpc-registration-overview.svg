@@ -119,6 +119,6 @@
   <text x="880" y="82" text-anchor="middle" class="label grey">node attestation, SVID signing (SPIRE protocol)</text>
 
   <!-- Legend -->
-  <text x="600" y="732" text-anchor="middle" class="legend">No bootstrap token · No CSR · No Secrets or ConfigMaps holding keys or certificates</text>
+  <text x="600" y="732" text-anchor="middle" class="legend">No bootstrap token · No CSR · No agent or gRPC server keys or certificates in Secrets or ConfigMaps</text>
   <text x="600" y="754" text-anchor="middle" class="legend">OCM components talk only to their local SPIRE agent for identity; SVIDs are short-lived and stay in memory</text>
 </svg>

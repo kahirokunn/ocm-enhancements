@@ -14,10 +14,10 @@ This proposal adds a new registration driver, `spiffe`, in which every OCM agent
 short-lived [SPIFFE](https://spiffe.io/) SVID issued by [SPIRE](https://spiffe.io/docs/latest/spire-about/).
 Klusterlet agents and add-on agents connect to the hub gRPC server over mutual TLS with their own
 X.509-SVIDs, and the hub gRPC server authenticates with its own X.509-SVID. Registration, renewal
-and revocation all work without a bootstrap token, without a CertificateSigningRequest, without a
-hub signing key, and without any Secret or ConfigMap that holds a private key, public key or
-certificate. The only identity service OCM talks to is the local SPIRE agent, through the SPIFFE
-Workload API.
+and revocation all work without a bootstrap token, without a CertificateSigningRequest, without
+OCM signing a credential for an agent, and without any Secret or ConfigMap that holds a key or
+certificate of an agent or of the hub gRPC server. The only identity service OCM talks to is the
+local SPIRE agent, through the SPIFFE Workload API.
 
 The driver supports the `Default` and `Singleton` Klusterlet install modes and applies the same
 model to add-ons. The `Hosted` and `SingletonHosted` modes are not supported: the Klusterlet API
@@ -38,8 +38,9 @@ The existing registration drivers (`csr`, `grpc`, `awsirsa`) and add-on registra
 
 - A bootstrap kubeconfig or bootstrap token must be distributed to each managed cluster and is
   valid until someone removes it.
-- The `csr` and `grpc` drivers have the hub sign client certificates, so the hub holds a signing
-  key (`signer-secret`) and the hub gRPC server holds a serving certificate in a Secret.
+- The `csr` and `grpc` drivers have the hub sign client certificates: the hub cluster's own CA
+  with `csr`, and OCM's signing key (`signer-secret`) with `grpc`. With `grpc` the hub gRPC server
+  also holds a serving certificate in a Secret (`grpc-server-serving-cert`).
 - The agent's private key and certificate are written to the `hub-kubeconfig-secret`, and each
   add-on's credentials to `<addon>-hub-kubeconfig` or `<addon>-<signer>-client-cert` Secrets.
   Anyone who can read those Secrets can act as the cluster or the add-on.
@@ -59,9 +60,12 @@ certificate authority.
 - Support the `Default` and `Singleton` Klusterlet install modes.
 - Support add-ons with the same model: each add-on agent registers, renews and is revoked using
   only its own SVID.
-- Agents hold only short-lived SVIDs, in memory. Nothing OCM creates stores key material.
-- OCM does not create Secrets or ConfigMaps for private keys, public keys or certificates, and does
-  not sign anything.
+- Agents hold only short-lived SVIDs, in memory. Nothing OCM creates stores key material for an
+  agent or for the hub gRPC server.
+- OCM does not create Secrets or ConfigMaps for the keys or certificates of agents or of the hub
+  gRPC server, and does not sign their credentials. The hub's admission webhooks are outside
+  this: they keep their serving certificates and the cluster-manager operator's CA, as today (see
+  [Operators](#operators)).
 - Apart from the local SPIRE agent's Workload API, OCM contacts no other identity or key service
   (no KMS, cloud identity provider, OIDC endpoint or SPIRE server API).
 - Keep the hub-side user experience unchanged for clusters: ManagedCluster acceptance, RBAC and
@@ -216,14 +220,17 @@ registration agent in `Default` mode, and the Klusterlet agent in `Singleton` mo
 2. The admin configures the `ClusterManager` with the `spiffe` driver, for example with
    `clusteradm init`.
 3. The cluster-manager operator deploys the gRPC server with a `csi.spiffe.io` volume for the
-   local Workload API and no Secret volumes. It creates no signing key, serving certificate,
-   bootstrap ServiceAccount or token.
+   local Workload API and no volume for a certificate or a CA bundle. It creates no serving
+   certificate for the gRPC server and no bootstrap ServiceAccount or token, and it signs no
+   agent certificate.
 4. The gRPC server opens a Workload API `X509Source` and receives, in memory, its own X.509-SVID and
    the trust bundle for the trust domain, plus any federated trust domains. It reports not ready
    until the first SVID arrives.
 5. It serves mTLS: it presents its SVID and verifies client SVIDs against the trust bundle. SPIRE
-   pushes rotated SVIDs and bundle updates over the same stream, and new handshakes use them.
-   The server also starts watching `ManagedCluster` and `ManagedClusterAddOn` for revocation.
+   pushes rotated SVIDs and bundle updates over the same stream. New handshakes use them, and
+   after a bundle update the server closes the open connections whose SVID the new bundle no
+   longer verifies. The server also starts watching `ManagedCluster` and `ManagedClusterAddOn`
+   for revocation.
 
 Reading its own SVID and the trust bundle from the local Workload API is all the hub does with
 SPIRE. It does not call the SPIRE server, create registration entries, mint SVIDs for agents or
@@ -267,7 +274,7 @@ the `csr` driver, would get exactly that group in its certificate.
   the client SVID's expiry for each connection and closes the connection when that SVID expires.
   The client reconnects with its current SVID and resyncs, as it already does after a reconnect.
 - The hub gRPC server renews its own serving SVID the same way.
-- OCM never signs, stores or rotates a certificate.
+- OCM never signs, stores or rotates a certificate of an agent or of the hub gRPC server.
 
 **Revoke.**
 
@@ -288,7 +295,11 @@ the `csr` driver, would get exactly that group in its certificate.
   agents, stops new SVIDs. SVIDs already issued stop working when they expire. Short TTLs are the
   revocation mechanism; there is no CRL in this design.
 - **Trust domain compromise.** SPIRE CA rotation and bundle updates reach OCM through the
-  Workload API, with no OCM change.
+  Workload API, with no OCM change. A bundle update by itself affects only new handshakes, so
+  the hub also checks the SVID of every open connection against the new bundle and closes the
+  ones that no longer verify. It does the same for a trust domain taken out of
+  `agentTrustDomains`. Example: the platform replaces a leaked CA. An SVID which that CA signed
+  stops working when the new bundle arrives, not up to `maxSVIDLifetime` later.
 
 **Unjoin.** Deleting the `ManagedCluster` on the hub and the `Klusterlet` on the managed cluster
 removes everything. There are no OCM Secrets to clean up, and the `ManagedCluster` does not wait
@@ -410,8 +421,9 @@ spec:
         # an agent; a longer-lived SVID is refused. The record of a deleted
         # cluster is kept this long; see "Deleting a cluster".
         maxSVIDLifetime: 24h
-        # Optional. Default: 5m. Allowed clock difference between SPIRE and the
-        # hub, used by the SVID validity checks and the deletion records.
+        # Optional. Default: 5m. How far ahead of the hub's clock SPIRE's may be:
+        # an SVID is accepted up to this long before its NotBefore, never after
+        # its NotAfter. The deletion records use the same allowance.
         maxClockSkew: 5m
         # Optional. The layout of agent SPIFFE IDs; every Klusterlet must use the
         # same templates. See "ID templates".
@@ -478,8 +490,11 @@ klusterlet operator renders each agent's ID from the template and records it in
 `status.spiffe.agentIDs`; an agent never builds its own ID.
 
 **Trust domains.** The hub accepts agent SVIDs from its own trust domain and from each one listed
-in `agentTrustDomains`; its SPIRE must federate with those trust domains. Each `ManagedCluster` is
-pinned to one trust domain, in the annotation `open-cluster-management.io/spiffe-trust-domain`:
+in `agentTrustDomains`; its SPIRE must federate with those trust domains. Federation has to be
+set on the registration entries of both sides: the hub gRPC server's entry federates with each
+agent trust domain, and each agent's entry federates with the hub's, so that each Workload API
+returns the other side's bundle (`federatesWith` in a `ClusterSPIFFEID`). Each `ManagedCluster`
+is pinned to one trust domain, in the annotation `open-cluster-management.io/spiffe-trust-domain`:
 
 - When an agent creates its cluster, the hub sets the annotation from the trust domain of the
   agent's SVID, whatever the request says.
@@ -606,10 +621,19 @@ All new fields sit behind a new `SPIFFERegistration` feature gate.
 
 #### Operators
 
-**Hub (cluster-manager operator).** Today it gives the gRPC server Secrets: the hub signing key
-(`signer-secret`), the server's TLS certificate, and a bootstrap ServiceAccount and token. In
-`spiffe` mode it creates none of them. It only mounts a `csi.spiffe.io` volume, which puts the
-local SPIRE agent's Workload API socket into the pod.
+**Hub (cluster-manager operator).** With the `grpc` driver it gives the gRPC server a serving
+certificate (`grpc-server-serving-cert`) and a CA bundle to verify agents with, and has the
+registration controller sign agent certificates with its CA (`signer-secret`). The installation
+also provides a bootstrap ServiceAccount or token. In `spiffe` mode none of that exists. The
+operator only mounts a `csi.spiffe.io` volume, which puts the local SPIRE agent's Workload API
+socket into the pod.
+
+The operator's CA does not go away. `signer-secret`, `ca-bundle-configmap` and the serving
+certificates of the hub's admission webhooks exist on every hub, whatever its drivers, and this
+proposal leaves them alone. They authenticate the webhooks to the hub kube-apiserver, and no
+agent presents or verifies anything they sign. They still matter here: the `ManagedCluster`
+webhook guards the trust-domain pin (see "Trust domains"), so the pin is only as safe as that
+webhook and its CA, which a hub admin controls, as today.
 
 **Managed cluster (klusterlet operator).** Today the agents start from a
 `bootstrap-hub-kubeconfig` Secret and the registration agent writes its credentials to
@@ -701,17 +725,26 @@ permissions: a binding the platform created, such as `edit` for a team in every 
 OCM's namespaces too, and OCM cannot take it away. The platform checks it, for example:
 
 ```shell
-# Who is bound in the namespace, and who is bound in every namespace.
+# Who is bound in the namespace, and who is bound in every namespace. Look at the
+# Group subjects as well as the users and ServiceAccounts.
 kubectl get rolebindings -n open-cluster-management-agent -o wide
 kubectl get clusterrolebindings -o wide
 
 # Each must answer "no" for every user and ServiceAccount that is not a cluster admin
-# or one of OCM's own ServiceAccounts.
-kubectl auth can-i create pods -n open-cluster-management-agent --as <user>
-kubectl auth can-i create pods/exec -n open-cluster-management-agent --as <user>
-kubectl auth can-i create serviceaccounts/token -n open-cluster-management-agent --as <user>
-kubectl auth can-i update configmaps -n open-cluster-management-agent-addon --as <user>
+# or one of OCM's own ServiceAccounts. --as alone asks for the user without its
+# groups, so name the user's groups with --as-group.
+kubectl auth can-i create pods -n open-cluster-management-agent \
+  --as <user> --as-group <group>
+kubectl auth can-i create pods/exec -n open-cluster-management-agent \
+  --as <user> --as-group <group>
+kubectl auth can-i create serviceaccounts/token -n open-cluster-management-agent \
+  --as <user> --as-group <group>
+kubectl auth can-i update configmaps -n open-cluster-management-agent-addon \
+  --as <user> --as-group <group>
 ```
+
+Example: `edit` is bound to the group `dev-team` in every namespace, and alice is a member.
+`--as alice` answers `no`. `--as alice --as-group dev-team` answers `yes`.
 
 **The one check RBAC cannot express.** RBAC decides who may create a Pod. It cannot say how the
 Pod's fields must relate. SPIRE tells the singleton agent and the work agent apart by the role
@@ -820,7 +853,12 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   with a new handshake, using its newer SVID. As a second check, unary and stream interceptors in
   `pkg/server/grpc/authn` reject any RPC whose peer SVID has already expired. The wrapper also
   refuses, in the handshake, a client SVID that lives longer than the configured maximum, and
-  records the SVID's `NotBefore` for the deletion records (see "Deleting a cluster").
+  records the SVID's `NotBefore` for the deletion records (see "Deleting a cluster"). It applies
+  `maxClockSkew` to `NotBefore` only: an SVID is never accepted after its `NotAfter`.
+
+  The registry keeps the peer certificate chain of each connection. When the Workload API
+  delivers a new trust bundle, the server verifies every registered chain against it and closes
+  the connections that fail. It does the same when a trust domain is no longer accepted.
 - **Client TLS** (`pkg/cloudevents/generic/options/grpc`). A client option dials the hub with the
   agent's SVID and accepts only the configured hub ID:
   `tlsconfig.MTLSClientConfig(source, source, tlsconfig.AuthorizeID(hubSPIFFEID))`. A server that
@@ -879,18 +917,20 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   with `protocol: grpc-spiffe`. That listener uses only the SPIFFE TLS credentials and the SPIFFE
   authenticator (no tokens, no OCM-signed certificates) and does not offer the CSR and
   token-request services.
-  - When `spiffe` is the only driver, only this listener runs, and the operator creates no signer,
-    serving certificate or bootstrap token.
+  - When `spiffe` is the only driver, only this listener runs. The operator creates no gRPC
+    serving certificate, and its CA signs nothing but the admission webhooks' serving
+    certificates (see Operators).
   - When `spiffe` is listed with `grpc` for migration, the existing `grpc` listener keeps running
     unchanged on its current port, with its current authentication and its CSR and token-request
     services. Agents that have not migrated keep working.
   - Both listeners share the same CloudEvents services and authorizer, so a cluster sees the same
     resources whichever one it uses. When `grpc` is removed from `registrationDrivers`, its
-    listener and its Secrets are removed.
+    listener and its serving certificate are removed.
 
   The server watches `ManagedCluster` and `ManagedClusterAddOn`. When a cluster is denied or
   deleted, its trust-domain pin changes, or an add-on is disabled, it closes the matching
-  connections right away through the connection registry described under sdk-go.
+  connections right away through the connection registry described under sdk-go. A trust bundle
+  update closes the connections it no longer verifies in the same way.
 
   Two checks decide what a reconnecting agent of such a cluster may do. Before the
   SubjectAccessReview, a gate on the listener refuses by identity: an existing cluster must be
@@ -943,7 +983,8 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
     The controller deletes the record when the deletion time plus `maxSVIDLifetime` plus
     `maxClockSkew` (default `5m`) has passed. By then every SVID the record refuses has expired:
     such an SVID was issued before the deletion time plus `maxClockSkew`, and lives no longer
-    than `maxSVIDLifetime`.
+    than `maxSVIDLifetime`. This holds because the hub never accepts an SVID after its
+    `NotAfter`; `maxClockSkew` is an allowance on `NotBefore` only.
   - **What a record does.** While a record for a cluster exists, the hub refuses every request
     for that cluster from an SVID issued earlier than the deletion time plus `maxClockSkew`. The
     hub reads the issue time from the SVID's `NotBefore`, which SPIRE sets to the time of issue,
@@ -1122,7 +1163,8 @@ compromised.
 *Mitigation:* the hub pins each cluster to the trust domain it registered from and refuses
 requests for `cluster2` from any other (see "Trust domains"). A compromised trust domain can act
 only for the clusters pinned to it, and can only create new, unaccepted clusters. The hub accepts
-only the trust domains in `agentTrustDomains`, however many its SPIRE federates with.
+only its own `trustDomain` and the trust domains in `agentTrustDomains`, however many its SPIRE
+federates with.
 
 **An agent changes its own cluster's pin.**
 Example: cluster1 uses the `grpc` driver and has no pin. Its agent sends an update that sets
@@ -1201,6 +1243,13 @@ A gRPC connection checks identity only once, when it opens.
 *Mitigation:* the hub closes each connection when the client's SVID expires (see the 10:40 / 11:00
 example above), and the agent reconnects with its current SVID.
 
+**A replaced CA keeps its open connections.**
+Example: the CA key of `east.example.org` leaks, and an attacker signs an SVID for cluster2 and
+connects. The platform replaces the CA and the hub receives the new bundle, but a bundle is
+checked only in a handshake.
+*Mitigation:* on every bundle update the hub verifies the SVID of each open connection against
+the new bundle and closes the ones that fail (see Server TLS under sdk-go).
+
 **Work arrives late after an SVID expires.**
 When an SVID expires, the hub closes every connection made with it, and the agent reconnects.
 The client's reconnect wait is shared by all the connections of one process and grows with each
@@ -1233,12 +1282,12 @@ in the trust domain.
 anything, so unknown clients are dropped early. Today, by contrast, anyone with the bootstrap
 token can start the join flow. Network-level protection is still advisable.
 
-**Clocks differ between clusters.**
-Example: a managed cluster's clock is 3 minutes ahead, so a fresh SVID looks "not valid yet" to
-the hub.
-*Mitigation:* clusters must run NTP, and the expiry check allows a small clock difference,
-`spiffe.maxClockSkew` on the `ClusterManager` (default `5m`). The deletion records use the same
-allowance.
+**SPIRE's clock and the hub's differ.**
+Example: the SPIRE server's clock is 3 minutes ahead of the hub's. It dates a fresh SVID from its
+own clock, so the SVID looks "not valid yet" to the hub.
+*Mitigation:* the SPIRE servers and the hub must run NTP, and the hub accepts an SVID up to
+`spiffe.maxClockSkew` (default `5m`, on the `ClusterManager`) before its `NotBefore`. It never
+accepts one after its `NotAfter`. The deletion records use the same allowance, on the same side.
 
 Security review should involve the SIG Architecture maintainers and someone familiar with SPIRE
 deployments.
@@ -1275,11 +1324,11 @@ All open questions are decided.
 4. **Which SPIRE topology should `clusteradm` and the e2e tests treat as the reference?** One
    shared trust domain, with every cluster's SPIRE agents attesting to one SPIRE server. The
    `clusteradm` defaults, the documentation and the e2e tests are built around it: the agents'
-   trust domain defaults to the hub's, `agentTrustDomains` has one entry, and every cluster is
-   pinned to it. Every managed cluster's SPIRE agents must reach the SPIRE server, for example
-   through an internal load balancer. Nested SPIRE servers look the same to OCM. Federated trust
-   domains, one per cluster, stay supported, and the e2e tests still cover one federated cluster
-   so that trust domain pinning is tested.
+   trust domain defaults to the hub's, `agentTrustDomains` is empty, and every cluster is pinned
+   to the hub's trust domain. Every managed cluster's SPIRE agents must reach the SPIRE server,
+   for example through an internal load balancer. Nested SPIRE servers look the same to OCM.
+   Federated trust domains, one per cluster, stay supported, and the e2e tests still cover one
+   federated cluster so that trust domain pinning is tested.
 
    A shared trust domain keeps the clusters apart only if the managed clusters cannot write its
    registration entries or sign for it. The e2e tests take each cluster's entries from
@@ -1297,11 +1346,13 @@ All open questions are decided.
   trust domain, cluster and add-on mismatch), the SPIFFE authenticator (including that only the
   Klusterlet agents get the `spiffe:agents` group), connection closure at SVID expiry (including
   that no further unary or stream RPC succeeds on that connection), connection shutdown on
-  cluster deny or delete and on add-on disable, and operator rendering of the SPIFFE Deployments
-  for `Default` and `Singleton`, and the operator's refusal of a `spiffe` Klusterlet in `Hosted`
-  and `SingletonHosted`. For a `spiffe` Klusterlet, check that the operator starts the work agent
-  without `hub-kubeconfig-secret` and sets `HubConnectionDegraded` to `Unknown`. For add-on
-  templates, check the decorator's SPIFFE form. Also cover the deletion records:
+  cluster deny or delete, on add-on disable, and on a trust bundle update that no longer verifies
+  the connection's SVID, and operator rendering of the SPIFFE Deployments for `Default` and
+  `Singleton`, and the operator's refusal of a `spiffe` Klusterlet in `Hosted` and
+  `SingletonHosted`. Check that an SVID is accepted up to `maxClockSkew` before its `NotBefore`
+  and never after its `NotAfter`. For a `spiffe` Klusterlet, check that the operator starts the
+  work agent without `hub-kubeconfig-secret` and sets `HubConnectionDegraded` to `Unknown`. For
+  add-on templates, check the decorator's SPIFFE form. Also cover the deletion records:
   - The record is written before the finalizer is removed, and deleted after `maxSVIDLifetime`
     plus `maxClockSkew`.
   - The finalizer is on the object from the write that pins it: an agent's create, and an
@@ -1331,8 +1382,10 @@ All open questions are decided.
   guarantee".
 - **Integration tests.** envtest plus an in-process fake Workload API that issues SVIDs from a
   test CA with short TTLs. Cover register, accept, rotation and reconnect, deny, delete, add-on
-  enable, rotation and disable, and the checks that no Secret or ConfigMap with hub credentials or
-  key material is created on the hub or the managed cluster.
+  enable, rotation and disable. Check what exists afterwards. With `spiffe` as the only driver,
+  the hub has no `grpc-server-serving-cert` and no bootstrap ServiceAccount or token; it has only
+  the operator's CA and the webhook serving certificates that every hub has. The managed cluster
+  has no Secret or ConfigMap with a hub credential or key material.
   Also cover `spiffe` and `grpc` listed together: a `grpc` agent and a `spiffe` agent both work,
   and one cluster migrates from one to the other. With the `ManagedClusterAutoApproval` feature
   gate on, check that a cluster registered by an auto-approved SPIFFE ID is accepted and that any
@@ -1489,6 +1542,8 @@ All open questions are decided.
   own, covered add-on templates, and stated that other add-ons stop when a cluster switches.
 - 2026-11-25: Required a cluster name, refused `MultipleHubs`, started the work agent without a
   hub kubeconfig Secret, and stated that a cluster's previous certificates outlive the switch.
+- 2026-11-25: Limited the no-key-material claim to agent and gRPC server identities, closed
+  connections on trust bundle updates, and applied the clock allowance to `NotBefore` only.
 
 ## Drawbacks
 

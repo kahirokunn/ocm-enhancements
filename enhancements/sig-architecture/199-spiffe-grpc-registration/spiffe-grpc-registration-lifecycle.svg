@@ -71,7 +71,7 @@
   <text x="1010" y="128" text-anchor="middle" class="label">1. ClusterManager: spiffe</text>
 
   <line x1="910" y1="170" x2="680" y2="170" class="msg" marker-end="url(#arrow)"/>
-  <text x="795" y="163" text-anchor="middle" class="label">2. deploy gRPC server, no Secrets</text>
+  <text x="795" y="163" text-anchor="middle" class="label">2. deploy gRPC server, no cert Secret</text>
 
   <line x1="680" y1="205" x2="230" y2="205" class="msg" marker-end="url(#arrow)"/>
   <text x="455" y="198" text-anchor="middle" class="label">3. FetchX509SVID (Workload API, hub node)</text>
@@ -126,7 +126,7 @@
   <text x="565" y="803" text-anchor="middle" class="label">18. close c1 connections; deny calls</text>
 
   <line x1="1110" y1="850" x2="230" y2="850" stroke="#777" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arrow-grey)"/>
-  <text x="670" y="843" text-anchor="middle" class="label grey">19. optional: delete SPIRE entries; no new SVIDs, current ones lapse within their TTL</text>
+  <text x="670" y="843" text-anchor="middle" class="label grey">19. platform deletes SPIRE entries; no new SVIDs, current ones lapse within their TTL</text>
 
-  <text x="600" y="912" text-anchor="middle" class="phase-sub">OCM reaches SPIRE only through the local agent's Workload API (steps 3 and 6), on the node where each pod runs. No CSR, no signer, no Secret.</text>
+  <text x="600" y="912" text-anchor="middle" class="phase-sub">OCM reaches SPIRE only through the local agent's Workload API (steps 3 and 6), on the node where each pod runs. No CSR, no OCM-signed agent certificate, no agent Secret.</text>
 </svg>
