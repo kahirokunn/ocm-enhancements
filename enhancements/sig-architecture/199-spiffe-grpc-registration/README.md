@@ -144,7 +144,7 @@ identity checks.
 | Workload | SPIFFE ID | OCM user | OCM groups |
 | --- | --- | --- | --- |
 | Hub gRPC server | `spiffe://<td>/ocm/hub/grpc-server` | n/a (server) | n/a |
-| Registration agent (`Default`) | `spiffe://<td>/ocm/cluster/<cluster>/agent/registration` | `system:open-cluster-management:<cluster>:registration` | `system:open-cluster-management:<cluster>`, `system:open-cluster-management:managed-clusters`, `system:open-cluster-management:spiffe-agents` |
+| Registration agent (`Default`) | `spiffe://<td>/ocm/cluster/<cluster>/agent/registration` | `system:open-cluster-management:<cluster>:registration` | `system:open-cluster-management:<cluster>`, `system:open-cluster-management:managed-clusters`, `system:open-cluster-management:spiffe:agents` |
 | Work agent (`Default`) | `spiffe://<td>/ocm/cluster/<cluster>/agent/work` | `system:open-cluster-management:<cluster>:work` | same as above |
 | Klusterlet agent (`Singleton`) | `spiffe://<td>/ocm/cluster/<cluster>/agent/klusterlet` | `system:open-cluster-management:<cluster>:klusterlet` | same as above |
 | Add-on agent (both modes) | `spiffe://<td>/ocm/cluster/<cluster>/addon/<addon>/agent/<agent>` | `system:open-cluster-management:cluster:<cluster>:addon:<addon>:agent:<agent>` | `system:open-cluster-management:cluster:<cluster>:addon:<addon>`, `system:open-cluster-management:addon:<addon>` |
@@ -155,9 +155,11 @@ cluster in the SVID, and any add-on request where the add-on in the event differ
 in the SVID.
 
 The hub also puts every Klusterlet agent it authenticates with an SVID in the group
-`system:open-cluster-management:spiffe-agents`. No certificate or token for the hub kube-apiserver
-carries that group, so a permission bound to it can be used only through the SPIFFE listener (see
-"Register" under [Lifecycle](#lifecycle)).
+`system:open-cluster-management:spiffe:agents`. No certificate or token for the hub kube-apiserver
+carries that group, whatever a cluster is called: a cluster's own group is
+`system:open-cluster-management:<cluster>`, and a cluster name cannot contain a colon. So a
+permission bound to the group can be used only through the SPIFFE listener (see "Register" under
+[Lifecycle](#lifecycle)).
 
 The platform must make sure SPIRE only issues `.../cluster/<cluster>/...` IDs to workloads that
 really belong to cluster `<cluster>`. One part is binding registration entries to the node
@@ -241,13 +243,18 @@ publish a CA bundle for agents; agents get the trust bundle from their own local
 There is no bootstrap stage. Before acceptance, the agent's identity is authorized only to create,
 get, list and watch its own `ManagedCluster`. The ClusterRole for this cannot name the cluster, so
 it covers every `ManagedCluster`; the SPIFFE listener is what holds each agent to its own. The
-ClusterRole is therefore bound to `system:open-cluster-management:spiffe-agents`, a group that
+ClusterRole is therefore bound to `system:open-cluster-management:spiffe:agents`, a group that
 only the SPIFFE listener assigns, and not to `system:open-cluster-management:managed-clusters`.
 The agents of the `csr` and `grpc` drivers are in `managed-clusters` too, and neither the hub
 kube-apiserver nor the existing `grpc` listener holds them to their own cluster for
 `ManagedCluster` requests. Bound to that group, the ClusterRole would let such an agent, on a hub
-with both drivers, list every `ManagedCluster` and create new ones. The hub CSR approval does
-not allow `spiffe-agents` in agent certificates.
+with both drivers, list every `ManagedCluster` and create new ones.
+
+The group's name has one colon more than a cluster's own group,
+`system:open-cluster-management:<cluster>`. The hub CSR approval allows an agent certificate
+only that group and `managed-clusters`, and a cluster name is a DNS label, so it has no colon. A
+group named `...:spiffe-agents` would not be safe: a cluster called `spiffe-agents`, joined with
+the `csr` driver, would get exactly that group in its certificate.
 
 **Renew.**
 
@@ -460,10 +467,16 @@ pinned to one trust domain, in the annotation `open-cluster-management.io/spiffe
   are already there: SPIRE can speak for a cluster only after an admin has said so for that
   cluster.
 - Only the hub gRPC server and users who may accept the cluster can set or change the pin. That
-  is the `managedclusters/accept` permission, which guards `hubAcceptsClient` today. The hub's
-  `ManagedCluster` admission webhook refuses the change from anyone else, on create and on update.
-  So an agent of another driver, which updates its `ManagedCluster` on the hub kube-apiserver
-  directly, can neither pin its cluster nor move it.
+  is the `managedclusters/accept` permission, which guards `hubAcceptsClient` today. Two checks
+  enforce it, one for each way a write reaches the hub:
+  - On the hub kube-apiserver, the `ManagedCluster` admission webhook refuses the change from
+    anyone else, on create and on update. So an agent of another driver, which updates its
+    `ManagedCluster` there directly, can neither pin its cluster nor move it.
+  - Through the gRPC server, the webhook sees only the server's own ServiceAccount, which it
+    lets through. So the gRPC server's cluster service keeps the pin out of an agent's reach
+    itself. On create it sets the pin from the SVID on the SPIFFE listener and drops it on the
+    `grpc` listener; on update it copies the pin from the stored object. Whatever the agent's
+    request carries is ignored. Today that service writes an agent's annotations as sent.
 - The hub refuses every request for a cluster from an SVID in any other trust domain, for the
   Klusterlet and the add-on agents alike.
 
@@ -477,9 +490,9 @@ must agree. The `csr` and `grpc` drivers agree to any cluster, because they chec
 it checks in its accept step instead:
 
 - When an agent creates its cluster, the hub records the agent's SPIFFE ID in the annotation
-  `open-cluster-management.io/spiffe-registered-by`, whatever the request says. The admission
-  webhook guards it like the pin: only the hub gRPC server and users who may accept the cluster
-  can set or change it.
+  `open-cluster-management.io/spiffe-registered-by`, whatever the request says. It is guarded
+  like the pin, by the admission webhook and by the gRPC server's cluster service: only the hub
+  gRPC server and users who may accept the cluster can set or change it.
 - The `spiffe` driver agrees only if that ID matches an entry of `autoApprovedIdentities`. An entry
   is a SPIFFE ID in which `*` stands for one whole path segment. With no entry, a `spiffe` cluster
   is never accepted automatically, even with the feature gate on.
@@ -542,8 +555,8 @@ All new fields sit behind a new `SPIFFERegistration` feature gate.
 | Annotation | `open-cluster-management.io/spiffe-trust-domain` | `ManagedCluster` | hub gRPC server, or a user who may accept the cluster |
 | Annotation | `open-cluster-management.io/spiffe-registered-by` | `ManagedCluster` | hub gRPC server |
 | Annotation | `agent.open-cluster-management.io/klusterlet-name` | `ManagedCluster` | registration agent of a `spiffe` Klusterlet |
-| Finalizer | `open-cluster-management.io/spiffe-revocation` | `ManagedCluster` | registration controller |
-| Group | `system:open-cluster-management:spiffe-agents` | Klusterlet agents on the SPIFFE listener | hub gRPC server |
+| Finalizer | `open-cluster-management.io/spiffe-revocation` | `ManagedCluster` | hub gRPC server, `ManagedCluster` mutating webhook, registration controller |
+| Group | `system:open-cluster-management:spiffe:agents` | Klusterlet agents on the SPIFFE listener | hub gRPC server |
 | Label | `open-cluster-management.io/spiffe-role` | agent and add-on Pods | klusterlet operator, add-on framework |
 | Condition | `SPIFFEAgentRolePolicyApplied` | `Klusterlet` | klusterlet operator |
 | Condition reasons | `InvalidSPIFFEConfiguration`, `SPIFFEInstallModeNotSupported` | `Klusterlet`, `Applied` | klusterlet operator |
@@ -731,11 +744,11 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   client's verified SVID and turns its SPIFFE ID into an OCM user and groups. For example,
   `spiffe://ocm-hub.example.org/ocm/cluster/cluster1/agent/work` becomes user
   `system:open-cluster-management:cluster1:work` with groups `system:open-cluster-management:cluster1`,
-  `system:open-cluster-management:managed-clusters`, `system:open-cluster-management:spiffe-agents`
+  `system:open-cluster-management:managed-clusters`, `system:open-cluster-management:spiffe:agents`
   and `system:authenticated`. It rejects IDs from another trust domain, or IDs that do not follow
   the scheme, such as `.../ocm/something-else`. It also notes when the SVID expires.
 
-  Only this authenticator assigns `system:open-cluster-management:spiffe-agents`, and only to
+  Only this authenticator assigns `system:open-cluster-management:spiffe:agents`, and only to
   Klusterlet agents. The pre-acceptance permission is bound to it, so that permission cannot be
   used by an agent of another driver (see "Register").
 
@@ -827,6 +840,21 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   requests and a denied cluster only its `ManagedCluster`, lease and events. The second check is
   what holds the singleton agent, whose one identity is both the registration and the work agent,
   to the same rules.
+
+  The cluster service (`pkg/server/services/cluster`) owns three fields of a `ManagedCluster`:
+  the `spiffe-trust-domain` and `spiffe-registered-by` annotations and the `spiffe-revocation`
+  finalizer. Today it writes what the agent sent, apart from the ClusterSet label, and it writes
+  with the gRPC server's ServiceAccount, so the admission webhook cannot tell what the agent
+  asked for from what the server decided. The service therefore sets these fields itself, on
+  both listeners:
+  - On create through the SPIFFE listener, it sets the two annotations from the SVID and adds
+    the finalizer.
+  - On create through the `grpc` listener, it removes all three from the request.
+  - On every update, it copies all three from the stored object.
+
+  Example: the agent of an accepted `grpc` cluster sends an update that adds
+  `spiffe-trust-domain: east.example.org`. The stored cluster has no pin, so the update is written
+  without one, and the hub still serves no SPIFFE agent for that cluster.
 - **Deleting a cluster** (`pkg/registration/hub`). Closing connections does not cancel an SVID
   that is still valid. Without a guard, an agent whose cluster was just deleted could reconnect and
   use its pre-acceptance permission to create the `ManagedCluster` again. The hub does not wait
@@ -838,13 +866,20 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
     the agents fail to connect, with an error that names the setting. The guard is never weakened
     without anyone noticing.
   - **A deletion record.** Each `ManagedCluster` pinned to a trust domain (see "Trust domains")
-    gets the finalizer `open-cluster-management.io/spiffe-revocation`. When the cluster is
-    deleted, the registration controller writes a record and then removes the finalizer at once.
-    The record is a ConfigMap in the hub namespace, named after the deleted object's UID. It holds
-    the cluster's name and its deletion time, and nothing secret. The controller deletes the
-    record when the deletion time plus `maxSVIDLifetime` plus `maxClockSkew` (default `5m`) has
-    passed. By then every SVID the record refuses has expired: such an SVID was issued before the
-    deletion time plus `maxClockSkew`, and lives no longer than `maxSVIDLifetime`.
+    has the finalizer `open-cluster-management.io/spiffe-revocation`. The finalizer is added by
+    the write that pins the cluster, not afterwards: by the gRPC server when an agent creates the
+    cluster, and by the `ManagedCluster` mutating webhook when an admin sets the pin. So a
+    cluster deleted a moment after it was created, or while the registration controller is down,
+    still leaves a record: the finalizer holds the object until the controller is back. The
+    finalizer stays when the pin is removed later.
+
+    When the cluster is deleted, the registration controller writes a record and then removes
+    the finalizer at once. The record is a ConfigMap in the hub namespace, named after the
+    deleted object's UID. It holds the cluster's name and its deletion time, and nothing secret.
+    The controller deletes the record when the deletion time plus `maxSVIDLifetime` plus
+    `maxClockSkew` (default `5m`) has passed. By then every SVID the record refuses has expired:
+    such an SVID was issued before the deletion time plus `maxClockSkew`, and lives no longer
+    than `maxSVIDLifetime`.
   - **What a record does.** While a record for a cluster exists, the hub refuses every request
     for that cluster from an SVID issued earlier than the deletion time plus `maxClockSkew`. The
     hub reads the issue time from the SVID's `NotBefore`, which SPIRE sets to the time of issue,
@@ -876,9 +911,17 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   the one in the example: the cluster shows up again, not accepted, and the admin deletes it once
   more.
 
-  When the `spiffe` driver is not enabled, the registration controller removes the
-  `spiffe-revocation` finalizer from every `ManagedCluster`, so turning the driver off leaves no
-  cluster that cannot be deleted.
+  The finalizer and the records follow the `SPIFFERegistration` feature gate, not the list of
+  drivers. While the gate is on, the registration controller writes a record for every deleted
+  cluster that has the finalizer, also when `spiffe` is not in `registrationDrivers`. Removing
+  the driver and adding it again therefore opens no gap. Records are deleted only while the
+  driver is listed, because their lifetime comes from its settings.
+
+  When the gate is turned off, the registration controller removes the finalizer from every
+  `ManagedCluster`, so no cluster is left that cannot be deleted. A cluster deleted while the
+  gate is off leaves no record. When the gate is turned on again, the controller puts the
+  finalizer back on the pinned clusters. An admin who turns it on again within `maxSVIDLifetime`
+  first removes the SPIRE entries of the clusters deleted in between.
 - **Operators** (`pkg/operator`). Render the SPIFFE version of the gRPC server Deployment and of
   each agent Deployment, for the `Default` and `Singleton` install modes. Refuse a `spiffe`
   Klusterlet in a hosted mode (see API).
@@ -1004,6 +1047,15 @@ requests for `cluster2` from any other (see "Trust domains"). A compromised trus
 only for the clusters pinned to it, and can only create new, unaccepted clusters. The hub accepts
 only the trust domains in `agentTrustDomains`, however many its SPIRE federates with.
 
+**An agent changes its own cluster's pin.**
+Example: cluster1 uses the `grpc` driver and has no pin. Its agent sends an update that sets
+`spiffe-trust-domain: east.example.org`. The gRPC server writes with its own ServiceAccount, so
+the admission webhook lets the write through, and `east.example.org` could then act as cluster1
+with no admin involved.
+*Mitigation:* the gRPC server's cluster service never takes the pin, `spiffe-registered-by` or
+the `spiffe-revocation` finalizer from an agent. It sets them itself on create and keeps the
+stored values on update, on both listeners (see the gRPC server under ocm).
+
 **A deleted cluster comes back.**
 Example: an admin deletes `ManagedCluster/c1`, but its agent still has an SVID valid for 40
 minutes. It reconnects and creates `c1` again.
@@ -1017,8 +1069,9 @@ To keep the cluster out for good, the platform removes its SPIRE registration en
 Example: the hub runs `csr` and `spiffe` during a migration. If the pre-acceptance ClusterRole were
 bound to `system:open-cluster-management:managed-clusters`, a `csr` agent, whose certificate has
 that group, could list every `ManagedCluster` and create new ones on the hub kube-apiserver.
-*Mitigation:* the role is bound to `system:open-cluster-management:spiffe-agents`, which only the
-SPIFFE authenticator gives and the CSR approval never puts in a certificate.
+*Mitigation:* the role is bound to `system:open-cluster-management:spiffe:agents`, which only the
+SPIFFE authenticator gives. No certificate can carry it: the CSR approval allows a cluster only
+its own group, `system:open-cluster-management:<cluster>`, and no cluster name contains a colon.
 
 **An agent presents the wrong SVID.**
 Example: the platform gives every pod a generic SVID as well, and the Workload API lists it first.
@@ -1138,20 +1191,25 @@ All open questions are decided.
 
 - **Unit tests.** SPIFFE ID parsing and mapping for every ID form (valid and invalid paths, wrong
   trust domain, cluster and add-on mismatch), the SPIFFE authenticator (including that only the
-  Klusterlet agents get `spiffe-agents`), connection closure at SVID
-  expiry (including that no further unary or stream RPC succeeds on that connection), connection
-  shutdown on cluster deny or delete and on add-on disable, and operator
-  rendering of the SPIFFE Deployments for `Default` and `Singleton`, and the operator's refusal of
-  a `spiffe` Klusterlet in `Hosted` and `SingletonHosted`. Also cover the deletion records:
+  Klusterlet agents get the `spiffe:agents` group), connection closure at SVID expiry (including
+  that no further unary or stream RPC succeeds on that connection), connection shutdown on
+  cluster deny or delete and on add-on disable, and operator rendering of the SPIFFE Deployments
+  for `Default` and `Singleton`, and the operator's refusal of a `spiffe` Klusterlet in `Hosted`
+  and `SingletonHosted`. Also cover the deletion records:
   - The record is written before the finalizer is removed, and deleted after `maxSVIDLifetime`
     plus `maxClockSkew`.
+  - The finalizer is on the object from the write that pins it: an agent's create, and an
+    admin's pin. A cluster deleted before the registration controller has seen it leaves a
+    record.
   - An SVID issued before the deletion is refused for every request, including with a SPIRE clock
     ahead of the hub's. The only exception is the work agent's `ManifestWork` cleanup of the
     object being deleted.
   - An SVID issued after the deletion can create the cluster again, and that cluster is not
     accepted automatically while the record exists.
   - An SVID that lives longer than `maxSVIDLifetime` is refused in the handshake.
-  - The finalizer is removed from every cluster when the driver is disabled.
+  - A cluster deleted while `spiffe` is not in `registrationDrivers` still leaves a record. The
+    finalizer is removed from every cluster when the feature gate is turned off, and put back on
+    the pinned clusters when it is turned on again.
 - **Agent role policy tests.** Against a real API server on Kubernetes 1.30 or later, for each of
   `Default` and `Singleton`: a Pod with an allowed ServiceAccount and role pair is accepted, every
   other pair with one of the Klusterlet's ServiceAccounts is refused (for example
@@ -1171,17 +1229,18 @@ All open questions are decided.
   key material is created on the hub or the managed cluster.
   Also cover `spiffe` and `grpc` listed together: a `grpc` agent and a `spiffe` agent both work,
   and one cluster migrates from one to the other. With the `ManagedClusterAutoApproval` feature
-  gate on, check that a cluster registered by an auto-approved SPIFFE ID is accepted, that any
-  other `spiffe` cluster waits for an admin, and that an agent can't set the
-  `spiffe-registered-by` annotation. Check that a cluster without a pin is refused until an admin
-  pins it, with one agent trust domain and with several, and that a cluster created outside the
-  SPIFFE listener and accepted automatically still serves no SPIFFE agent. Check that the
-  admission webhook lets only the hub gRPC server and users with `managedclusters/accept` set or
-  change the two annotations. With `spiffe` enabled next to `csr` and `grpc`, check that a `csr`
-  agent on the hub kube-apiserver and a `grpc` agent on its listener can still read only their
-  own `ManagedCluster` and create no other. For add-ons, check that a `customSigner` registration,
-  and a `kubeClient` subject that no SVID can carry, are reported on the `ManagedClusterAddOn` and
-  not served.
+  gate on, check that a cluster registered by an auto-approved SPIFFE ID is accepted and that any
+  other `spiffe` cluster waits for an admin. Check that a cluster without a pin is refused until
+  an admin pins it, with one agent trust domain and with several, and that a cluster created
+  outside the SPIFFE listener and accepted automatically still serves no SPIFFE agent. Check that
+  the admission webhook lets only the hub gRPC server and users with `managedclusters/accept` set
+  or change the two annotations. Check that through the gRPC server an agent can set, change or
+  remove neither annotation nor the `spiffe-revocation` finalizer: on the SPIFFE listener and on
+  the `grpc` listener, on create and on update. With `spiffe` enabled next to `csr` and `grpc`,
+  check that a `csr` agent on the hub kube-apiserver and a `grpc` agent on its listener can still
+  read only their own `ManagedCluster` and create no other. For add-ons, check that a
+  `customSigner` registration, and a `kubeClient` subject that no SVID can carry, are reported on
+  the `ManagedClusterAddOn` and not served.
 - **API tests.** The `Klusterlet` CRD accepts `spiffe` with `deployOption.mode` empty, `Default`
   or `Singleton`, refuses it with `Hosted` and `SingletonHosted`, still accepts other drivers in
   the hosted modes, and refuses moving a `spiffe` Klusterlet to a hosted mode.
@@ -1241,13 +1300,14 @@ All open questions are decided.
   `<addon>-spiffe` ConfigMap once the add-on's registration uses another driver. On the hub, the
   cluster's `spiffe-trust-domain` and `spiffe-registered-by` annotations stay and mean nothing to
   the other drivers; an admin can remove them.
-- Downgrade of the hub: remove `spiffe` from `registrationDrivers` first, while the hub still runs
-  a version that knows the driver. The registration controller then removes the
-  `spiffe-revocation` finalizer from every `ManagedCluster`, and the operator removes the SPIFFE
-  listener, its Service and the pre-acceptance ClusterRole and binding. A hub downgraded without
-  that step keeps the finalizer on its clusters, and an admin has to remove it by hand before
-  they can be deleted. Deletion records that are left over are plain ConfigMaps and can be
-  deleted.
+- Downgrade of the hub: remove `spiffe` from `registrationDrivers` and turn the
+  `SPIFFERegistration` feature gate off first, while the hub still runs a version that knows the
+  driver. The operator removes the SPIFFE listener, its Service and the pre-acceptance
+  ClusterRole and binding, and with the gate off the registration controller removes the
+  `spiffe-revocation` finalizer from every `ManagedCluster`. Removing only the driver keeps the
+  finalizer and the records (see "Deleting a cluster"). A hub downgraded with the gate still on
+  keeps the finalizer on its clusters, and an admin has to remove it by hand before they can be
+  deleted. Deletion records that are left over are plain ConfigMaps and can be deleted.
 
 ### Version Skew Strategy
 
@@ -1291,6 +1351,9 @@ All open questions are decided.
   for client-side reconnect and for reporting the hub connection.
 - 2026-11-20: Stated that whoever can write registration entries for a shared trust domain can
   act as any cluster in it, and how a platform keeps its clusters apart.
+- 2026-11-25: Closed three ways around the trust-domain pin and the deletion records: a group
+  name that no cluster name can produce, pin fields that the gRPC server's cluster service never
+  takes from an agent, and a finalizer that is set with the pin and follows the feature gate.
 
 ## Drawbacks
 
