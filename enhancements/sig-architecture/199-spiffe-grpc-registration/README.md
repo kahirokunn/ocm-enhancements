@@ -88,6 +88,9 @@ certificate authority.
   and need a credential for the managed cluster's kube-apiserver, which today is a kubeconfig in a
   Secret (`external-managed-kubeconfig`). That breaks the rule that OCM keeps no long-lived
   credentials. **Feature to do:** support the hosted modes with SVIDs only.
+- The `MultipleHubs` feature (`bootstrapKubeConfigs`). It moves an agent between hubs by choosing
+  among bootstrap kubeconfig Secrets, which this driver does not have. The Klusterlet API refuses
+  it with `spiffe`.
 
 ## Proposal
 
@@ -543,6 +546,14 @@ under an older CRD. It deploys no agent, reports no SPIFFE IDs and sets `Applied
 reason `SPIFFEInstallModeNotSupported`. It does this before it looks for any managed-cluster
 kubeconfig.
 
+**Cluster name and hubs.** A `spiffe` Klusterlet must set `spec.clusterName`. With the other
+drivers an agent without one generates a name and keeps it in `hub-kubeconfig-secret`. This
+driver has no such Secret, so the name would change at every restart, and the agents' IDs, for
+which the platform creates SPIRE entries, are rendered from it. A `spiffe` Klusterlet must also
+leave `bootstrapKubeConfigs` at `None`: the `MultipleHubs` feature chooses among bootstrap
+kubeconfig Secrets. The CRD refuses both, on create and on update. The klusterlet operator
+checks the same two rules and sets `Applied=False` with reason `InvalidSPIFFEConfiguration`.
+
 The `Klusterlet` status gets one new field, `spiffe`, and one new condition,
 `SPIFFEAgentRolePolicyApplied` (see [Operators](#operators)). The field holds no key material. Its
 `agentIDs` list has the SPIFFE ID of each agent, rendered from the agent ID template. These are
@@ -585,6 +596,7 @@ All new fields sit behind a new `SPIFFERegistration` feature gate.
 | Label | `open-cluster-management.io/spiffe-role` | agent and add-on Pods | klusterlet operator, add-on framework, ocm add-on manager |
 | Condition | `SPIFFEAgentRolePolicyApplied` | `Klusterlet` | klusterlet operator |
 | Condition reasons | `InvalidSPIFFEConfiguration`, `SPIFFEInstallModeNotSupported` | `Klusterlet`, `Applied` | klusterlet operator |
+| Condition reason | `HubConnectionNotChecked` | `Klusterlet`, `HubConnectionDegraded` | klusterlet operator |
 | Condition | `SPIFFEConfigApplied`, with reasons `AddOnNotSPIFFEReady` and `CustomSignerNotSupported` | `ManagedClusterAddOn` | registration agent |
 | Condition reason | `SubjectNotSupportedBySPIFFE` | `ManagedClusterAddOn`, `RegistrationApplied` | add-on manager |
 | ConfigMap | `<addon>-spiffe` | add-on install namespace | registration agent |
@@ -976,7 +988,14 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   first removes the SPIRE entries of the clusters deleted in between.
 - **Operators** (`pkg/operator`). Render the SPIFFE version of the gRPC server Deployment and of
   each agent Deployment, for the `Default` and `Singleton` install modes. Refuse a `spiffe`
-  Klusterlet in a hosted mode (see API).
+  Klusterlet in a hosted mode, without a cluster name or with `bootstrapKubeConfigs` (see API).
+
+  The klusterlet operator also stops waiting for `hub-kubeconfig-secret`. Today it checks that
+  Secret to set `HubConnectionDegraded`, and keeps the work agent at zero replicas until the
+  Secret exists. A `spiffe` Klusterlet never has it. So for `spiffe` the operator skips the
+  check, sets `HubConnectionDegraded` to `Unknown` with reason `HubConnectionNotChecked`, and
+  starts the work agent together with the registration agent. Until the cluster is accepted, the
+  hub refuses the work agent's requests and the agent retries.
 - **Agents.** The registration agent does not start its Secret-based hub-kubeconfig controller.
   The work agent and add-on agents fetch their own SVIDs instead of reading a Secret written by
   the registration agent. For each add-on that declares SPIFFE support, the registration agent
@@ -1131,6 +1150,25 @@ that group, could list every `ManagedCluster` and create new ones on the hub kub
 SPIFFE authenticator gives. No certificate can carry it: the CSR approval allows a cluster only
 its own group, `system:open-cluster-management:<cluster>`, and no cluster name contains a colon.
 
+**Credentials from the previous driver outlive the switch.**
+A client certificate cannot be revoked, and the hub RBAC is bound to the same groups for every
+driver. Example: cluster1 moves from `csr` to `spiffe`. Someone who copied its
+`hub-kubeconfig-secret` before the switch can still reach the hub kube-apiserver as cluster1
+until that certificate expires, which can be months away. The pin, the limit on SVID lifetime and
+the deletion records do not apply to it. The same holds for the add-ons' `<addon>-hub-kubeconfig`
+Secrets.
+*Mitigation:* the switch removes the Secrets from the managed cluster, but not copies taken
+earlier. This is the exposure the cluster had before the switch; the switch does not end it
+early. The platform decides per cluster:
+
+- Before the switch, read the expiry of the certificate in `hub-kubeconfig-secret` (key
+  `tls.crt`), and treat the cluster as fully moved only after that date.
+- Set `clientCertExpirationSeconds` on the Klusterlet ahead of time, so the certificates in use
+  at the switch are short-lived. It shortens only certificates issued after it is set; one issued
+  earlier keeps its own expiry.
+- Where a copy may be out, do not move the cluster. Delete it and join it again under a new
+  name. The old certificate's groups then have no RBAC left on the hub.
+
 **An agent presents the wrong SVID.**
 Example: the platform gives every pod a generic SVID as well, and the Workload API lists it first.
 The agent would present that ID and the hub would reject it.
@@ -1261,8 +1299,9 @@ All open questions are decided.
   that no further unary or stream RPC succeeds on that connection), connection shutdown on
   cluster deny or delete and on add-on disable, and operator rendering of the SPIFFE Deployments
   for `Default` and `Singleton`, and the operator's refusal of a `spiffe` Klusterlet in `Hosted`
-  and `SingletonHosted`. For add-on templates, check the decorator's SPIFFE form. Also cover the
-  deletion records:
+  and `SingletonHosted`. For a `spiffe` Klusterlet, check that the operator starts the work agent
+  without `hub-kubeconfig-secret` and sets `HubConnectionDegraded` to `Unknown`. For add-on
+  templates, check the decorator's SPIFFE form. Also cover the deletion records:
   - The record is written before the finalizer is removed, and deleted after `maxSVIDLifetime`
     plus `maxClockSkew`.
   - The finalizer is on the object from the write that pins it: an agent's create, and an
@@ -1312,9 +1351,11 @@ All open questions are decided.
   `SPIFFEConfigApplied=True`, and that a changed `<addon>-spiffe` ConfigMap is put back.
 - **API tests.** The `Klusterlet` CRD accepts `spiffe` with `deployOption.mode` empty, `Default`
   or `Singleton`, refuses it with `Hosted` and `SingletonHosted`, still accepts other drivers in
-  the hosted modes, and refuses moving a `spiffe` Klusterlet to a hosted mode. The
-  `ManagedClusterAddOn` CRD accepts the driver `spiffe` in `v1beta1` and in `v1alpha1`, and an
-  add-on with that driver can be updated through either version.
+  the hosted modes, and refuses moving a `spiffe` Klusterlet to a hosted mode. It refuses `spiffe`
+  without `spec.clusterName` and with `bootstrapKubeConfigs` of type `LocalSecrets`, and still
+  accepts both for the other drivers. The `ManagedClusterAddOn` CRD accepts the driver `spiffe`
+  in `v1beta1` and in `v1alpha1`, and an add-on with that driver can be updated through either
+  version.
 - **E2E tests.** kind clusters with SPIRE installed from the SPIFFE Helm charts, run for each of
   `Default` and `Singleton`: join, accept, ManifestWork apply and status, add-on enable and status
   sync, SVID rotation under load, and revocation of a cluster and of a single add-on. Also check
@@ -1343,8 +1384,9 @@ All open questions are decided.
     expiry, so work no longer arrives late after an SVID expires (see sdk-go).
   - A `Klusterlet` condition that reports whether the agents reach the hub in `spiffe` mode: hub
     unreachable, wrong hub SPIFFE ID, or an SVID the hub refuses.
-- **GA.** Used in production by at least one adopter, with migration from the `grpc` driver
-  documented and tested.
+- **GA.** Used in production by at least one adopter, with migration from the `csr` and `grpc`
+  drivers documented and tested, including how long a cluster's previous certificates stay usable
+  and what to do about them.
 
 ### Upgrade / Downgrade Strategy
 
@@ -1359,8 +1401,9 @@ All open questions are decided.
   ManagedCluster, namespace, ManifestWorks and RBAC when its Klusterlet switches to `spiffe`. An
   admin first pins the cluster to its trust domain, for example with
   `clusteradm accept --clusters cluster1 --spiffe-trust-domain ocm-hub.example.org`; until then the
-  hub serves no SPIFFE agent for it. Once the registration agent is connected with its SVID, it
-  deletes the old `hub-kubeconfig-secret` and `bootstrap-hub-kubeconfig`, and every add-on's
+  hub serves no SPIFFE agent for it. The Klusterlet must have `spec.clusterName` set, to the name
+  the cluster already has. Once the registration agent is connected with its SVID, it deletes the
+  old `hub-kubeconfig-secret` and `bootstrap-hub-kubeconfig`, and every add-on's
   `<addon>-hub-kubeconfig` and client-certificate Secret.
 - Add-ons do not move by themselves. An add-on keeps running after the switch only if it has
   declared SPIFFE support (see [Add-ons](#add-ons)). Any other add-on stops at the switch, when
@@ -1368,6 +1411,9 @@ All open questions are decided.
   the switch, the admin checks each `ManagedClusterAddOn` of the cluster for the
   `spiffe-supported` annotation, and upgrades or disables the add-ons that lack it. Add-ons keep
   their install namespaces, shared ones included.
+- The switch does not cancel the cluster's previous credentials. A certificate issued by the
+  previous driver, for the cluster or for an add-on, works on the hub until it expires, for
+  whoever kept a copy (see [Risks and Mitigation](#risks-and-mitigation)).
 - Before the switch, the platform checks the managed cluster's RBAC (see Operators).
 - Switching between `Default` and `Singleton` works as today. A Klusterlet in `Hosted` or
   `SingletonHosted` mode cannot switch to `spiffe`, and a `spiffe` Klusterlet cannot switch to a
@@ -1377,8 +1423,10 @@ All open questions are decided.
   bootstrap kubeconfig, as for a new join. The klusterlet operator removes the agent role policy
   and its binding and clears `status.spiffe`. The registration agent deletes each add-on's
   `<addon>-spiffe` ConfigMap once the add-on's registration uses another driver. On the hub, the
-  cluster's `spiffe-trust-domain` and `spiffe-registered-by` annotations stay and mean nothing to
-  the other drivers; an admin can remove them.
+  admin then removes the cluster's `spiffe-trust-domain` annotation, and the platform removes the
+  cluster's SPIRE entries. The other drivers ignore the pin, but the SPIFFE listener does not:
+  while the pin is there, an SVID for the cluster is still served. The `spiffe-registered-by`
+  annotation and the `spiffe-revocation` finalizer can stay.
 - Downgrade of the hub: remove `spiffe` from `registrationDrivers` and turn the
   `SPIFFERegistration` feature gate off first, while the hub still runs a version that knows the
   driver. The operator removes the SPIFFE listener, its Service and the pre-acceptance
@@ -1397,9 +1445,10 @@ All open questions are decided.
 - An agent configured for `spiffe` requires a hub that serves the `spiffe` driver. Against an
   older hub there is no SPIFFE listener, so the agents can't connect: they log the error and
   retry, and the `ManagedCluster` is never created or stops being updated. The Klusterlet's
-  `HubConnectionDegraded` condition doesn't show it, because with `spiffe` the operator has no
-  hub kubeconfig to check. Reporting the hub connection of a `spiffe` Klusterlet in a condition
-  is a Beta criterion.
+  `HubConnectionDegraded` condition doesn't show it. With `spiffe` the operator has no hub
+  kubeconfig to check, so the condition is `Unknown` with reason `HubConnectionNotChecked` (see
+  Operators under ocm). Reporting the hub connection of a `spiffe` Klusterlet in a condition is a
+  Beta criterion.
 - Older agents keep using their existing drivers against a newer hub.
 - A `spiffe` Klusterlet in a hosted mode created under a CRD without the install-mode rule is
   refused by a newer klusterlet operator, which deploys no agent for it (see API).
@@ -1438,6 +1487,8 @@ All open questions are decided.
   takes from an agent, and a finalizer that is set with the pin and follows the feature gate.
 - 2026-11-25: Had add-ons declare SPIFFE support, gave the registration agent a condition of its
   own, covered add-on templates, and stated that other add-ons stop when a cluster switches.
+- 2026-11-25: Required a cluster name, refused `MultipleHubs`, started the work agent without a
+  hub kubeconfig Secret, and stated that a cluster's previous certificates outlive the switch.
 
 ## Drawbacks
 
