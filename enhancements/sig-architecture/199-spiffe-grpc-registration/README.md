@@ -21,7 +21,8 @@ local SPIRE agent, through the SPIFFE Workload API.
 
 The driver supports the `Default` and `Singleton` Klusterlet install modes and applies the same
 model to add-ons. The `Hosted` and `SingletonHosted` modes are not supported: the Klusterlet API
-refuses `spiffe` in them. Supporting them is a feature to do later.
+refuses `spiffe` in them. On the hub, the `ClusterManager` must be in `Default` mode; its `Hosted`
+mode is refused in the same way. Supporting the hosted modes is a feature to do later.
 
 An add-on agent reaches the hub only through the gRPC server. An add-on whose agent needs the hub
 kube-apiserver, or a certificate signed on the hub, cannot run on a `spiffe` cluster until it is
@@ -92,6 +93,10 @@ certificate authority.
   and need a credential for the managed cluster's kube-apiserver, which today is a kubeconfig in a
   Secret (`external-managed-kubeconfig`). That breaks the rule that OCM keeps no long-lived
   credentials. **Feature to do:** support the hosted modes with SVIDs only.
+- The `Hosted` mode of the `ClusterManager`. There the hub's controllers, the gRPC server among
+  them, run on a management cluster and reach the hub kube-apiserver with a kubeconfig in a
+  Secret (`external-hub-kubeconfig`), which breaks the same rule. The `ClusterManager` API
+  refuses `spiffe` in that mode.
 - The `MultipleHubs` feature (`bootstrapKubeConfigs`). It moves an agent between hubs by choosing
   among bootstrap kubeconfig Secrets, which this driver does not have. The Klusterlet API refuses
   it with `spiffe`.
@@ -204,6 +209,11 @@ request.
   Klusterlet API refuses `authType: spiffe` with either mode, and the klusterlet operator deploys
   no agent for such a Klusterlet. **Feature to do:** support both hosted modes with SVIDs only,
   including access to the managed cluster.
+- **The hub must be in `Default` mode.** A `ClusterManager` in `Hosted` mode runs the gRPC server
+  on a management cluster, with a kubeconfig Secret for the hub kube-apiserver. The server's SVID
+  would come from the management cluster's SPIRE, not the hub's, and the Secret is a stored
+  credential of the kind this driver avoids. The `ClusterManager` API refuses the `spiffe` driver
+  in that mode.
 
 ### Lifecycle
 
@@ -569,6 +579,13 @@ leave `bootstrapKubeConfigs` at `None`: the `MultipleHubs` feature chooses among
 kubeconfig Secrets. The CRD refuses both, on create and on update. The klusterlet operator
 checks the same two rules and sets `Applied=False` with reason `InvalidSPIFFEConfiguration`.
 
+**Hub install mode.** A validation rule on the `ClusterManager` refuses a `spiffe` entry in
+`registrationDrivers` unless `deployOption.mode` is `Default`. The mode of a `ClusterManager`
+cannot be changed once it is applied, so a hub in `Hosted` mode keeps its other drivers. The
+cluster-manager operator checks the same rule, for a `ClusterManager` that got past it under an
+older CRD: it does not enable the driver, and sets `Applied=False` with reason
+`SPIFFEInstallModeNotSupported`.
+
 The `Klusterlet` status gets one new field, `spiffe`, and one new condition,
 `SPIFFEAgentRolePolicyApplied` (see [Operators](#operators)). The field holds no key material. Its
 `agentIDs` list has the SPIFFE ID of each agent, rendered from the agent ID template. These are
@@ -610,7 +627,7 @@ All new fields sit behind a new `SPIFFERegistration` feature gate.
 | Group | `system:open-cluster-management:spiffe:agents` | Klusterlet agents on the SPIFFE listener | hub gRPC server |
 | Label | `open-cluster-management.io/spiffe-role` | agent and add-on Pods | klusterlet operator, add-on framework, ocm add-on manager |
 | Condition | `SPIFFEAgentRolePolicyApplied` | `Klusterlet` | klusterlet operator |
-| Condition reasons | `InvalidSPIFFEConfiguration`, `SPIFFEInstallModeNotSupported` | `Klusterlet`, `Applied` | klusterlet operator |
+| Condition reasons | `InvalidSPIFFEConfiguration`, `SPIFFEInstallModeNotSupported` | `Klusterlet` and `ClusterManager`, `Applied` | klusterlet operator, cluster-manager operator |
 | Condition reason | `HubConnectionNotChecked` | `Klusterlet`, `HubConnectionDegraded` | klusterlet operator |
 | Condition | `SPIFFEConfigApplied`, with reasons `AddOnNotSPIFFEReady` and `CustomSignerNotSupported` | `ManagedClusterAddOn` | registration agent |
 | Condition reason | `SubjectNotSupportedBySPIFFE` | `ManagedClusterAddOn`, `RegistrationApplied` | add-on manager |
@@ -1029,7 +1046,8 @@ sdk-go holds the shared gRPC server and client code, so most of the SPIFFE logic
   first removes the SPIRE entries of the clusters deleted in between.
 - **Operators** (`pkg/operator`). Render the SPIFFE version of the gRPC server Deployment and of
   each agent Deployment, for the `Default` and `Singleton` install modes. Refuse a `spiffe`
-  Klusterlet in a hosted mode, without a cluster name or with `bootstrapKubeConfigs` (see API).
+  Klusterlet in a hosted mode, without a cluster name or with `bootstrapKubeConfigs`, and the
+  `spiffe` driver on a `ClusterManager` in `Hosted` mode (see API).
 
   The klusterlet operator also stops waiting for `hub-kubeconfig-secret`. Today it checks that
   Secret to set `HubConnectionDegraded`, and keeps the work agent at zero replicas until the
@@ -1338,7 +1356,8 @@ All open questions are decided.
 5. **Hosted modes.** Decided: the `Hosted` and `SingletonHosted` modes are not part of this
    proposal, because their agents need a stored kubeconfig for the managed cluster. Supporting
    them is a feature to do later, for example with the agents reaching the managed cluster's
-   kube-apiserver with JWT-SVIDs.
+   kube-apiserver with JWT-SVIDs. The `Hosted` mode of the `ClusterManager` is left out for the
+   same reason: its gRPC server needs a stored kubeconfig for the hub.
 
 ### Test Plan
 
@@ -1348,11 +1367,12 @@ All open questions are decided.
   that no further unary or stream RPC succeeds on that connection), connection shutdown on
   cluster deny or delete, on add-on disable, and on a trust bundle update that no longer verifies
   the connection's SVID, and operator rendering of the SPIFFE Deployments for `Default` and
-  `Singleton`, and the operator's refusal of a `spiffe` Klusterlet in `Hosted` and
-  `SingletonHosted`. Check that an SVID is accepted up to `maxClockSkew` before its `NotBefore`
-  and never after its `NotAfter`. For a `spiffe` Klusterlet, check that the operator starts the
-  work agent without `hub-kubeconfig-secret` and sets `HubConnectionDegraded` to `Unknown`. For
-  add-on templates, check the decorator's SPIFFE form. Also cover the deletion records:
+  `Singleton`, and the operators' refusal of a `spiffe` Klusterlet in `Hosted` and
+  `SingletonHosted` and of the `spiffe` driver on a `ClusterManager` in `Hosted` mode. Check that
+  an SVID is accepted up to `maxClockSkew` before its `NotBefore` and never after its `NotAfter`.
+  For a `spiffe` Klusterlet, check that the operator starts the work agent without
+  `hub-kubeconfig-secret` and sets `HubConnectionDegraded` to `Unknown`. For add-on templates,
+  check the decorator's SPIFFE form. Also cover the deletion records:
   - The record is written before the finalizer is removed, and deleted after `maxSVIDLifetime`
     plus `maxClockSkew`.
   - The finalizer is on the object from the write that pins it: an agent's create, and an
@@ -1408,7 +1428,9 @@ All open questions are decided.
   without `spec.clusterName` and with `bootstrapKubeConfigs` of type `LocalSecrets`, and still
   accepts both for the other drivers. The `ManagedClusterAddOn` CRD accepts the driver `spiffe`
   in `v1beta1` and in `v1alpha1`, and an add-on with that driver can be updated through either
-  version.
+  version. The `ClusterManager` CRD accepts `spiffe` in `registrationDrivers` with
+  `deployOption.mode: Default`, refuses it with `Hosted`, and still accepts the other drivers
+  there.
 - **E2E tests.** kind clusters with SPIRE installed from the SPIFFE Helm charts, run for each of
   `Default` and `Singleton`: join, accept, ManifestWork apply and status, add-on enable and status
   sync, SVID rotation under load, and revocation of a cluster and of a single add-on. Also check
@@ -1419,10 +1441,10 @@ All open questions are decided.
 ### Graduation Criteria
 
 - **Alpha.** Behind the `SPIFFERegistration` feature gate. The `Default` and `Singleton` install
-  modes and add-on registration supported; the hosted modes refused. Add-on registration includes
-  the add-on framework's part, without which no add-on can use the driver: the declaration of
-  support, the changed rendering, the client helper and the `helloworld-spiffe` example. Unit
-  and integration tests.
+  modes and add-on registration supported; the hosted modes refused, for the Klusterlet and for
+  the `ClusterManager`. Add-on registration includes the add-on framework's part, without which
+  no add-on can use the driver: the declaration of support, the changed rendering, the client
+  helper and the `helloworld-spiffe` example. Unit and integration tests.
 - **Beta.**
   - E2E tests for both supported modes and add-ons in CI.
   - `clusteradm` support.
@@ -1472,6 +1494,9 @@ All open questions are decided.
   `SingletonHosted` mode cannot switch to `spiffe`, and a `spiffe` Klusterlet cannot switch to a
   hosted mode; the API refuses both. Such clusters keep their current driver until the hosted
   modes are supported.
+- A hub whose `ClusterManager` is in `Hosted` mode cannot enable `spiffe`. Its mode cannot be
+  changed once it is applied, so such a hub keeps its current drivers until that mode is
+  supported.
 - Downgrade of a cluster: switch the Klusterlet back to its previous drivers and provide a
   bootstrap kubeconfig, as for a new join. The klusterlet operator removes the agent role policy
   and its binding and clears `status.spiffe`. The registration agent deletes each add-on's
@@ -1544,6 +1569,8 @@ All open questions are decided.
   hub kubeconfig Secret, and stated that a cluster's previous certificates outlive the switch.
 - 2026-11-25: Limited the no-key-material claim to agent and gRPC server identities, closed
   connections on trust bundle updates, and applied the clock allowance to `NotBefore` only.
+- 2026-11-25: Refused the driver on a `ClusterManager` in `Hosted` mode, as on the hosted
+  Klusterlet modes.
 
 ## Drawbacks
 
@@ -1558,7 +1585,7 @@ All open questions are decided.
   must be changed to use the gRPC services and their SVID, and the gRPC server serves only a fixed
   set of resources.
 - Clusters in `Hosted` or `SingletonHosted` mode cannot use the driver until the hosted modes are
-  supported.
+  supported, and neither can a hub whose `ClusterManager` is in `Hosted` mode.
 
 ## Alternatives
 
