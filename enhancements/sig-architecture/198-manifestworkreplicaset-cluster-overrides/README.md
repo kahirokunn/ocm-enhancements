@@ -533,10 +533,11 @@ that shapes its payload, following the Kubernetes object model. This follows @ev
 proposal on [#202][pr-202-everpeace], and @kahirokunn's decision as approver on
 [#202][pr-202-kahirokunn-declarative] to keep the alpha API declarative.
 
-The validating webhook checks that names in `overridePolicies` are unique. It does **not**
-reject a name that does not exist yet, so an MWRS and its policies can be applied in any order,
-for example by a GitOps tool syncing a directory. A listed policy that does not exist is
-reported on the MWRS (see [Failure handling](#failure-handling)), not ignored.
+Names in `overridePolicies` are unique. The list is `+listType=map` keyed by `name`, so the
+API server rejects a duplicate and the validating webhook does not check for one. A name that
+does not exist yet is **not** rejected, so an MWRS and its policies can be applied in any
+order, for example by a GitOps tool syncing a directory. A listed policy that does not exist
+is reported on the MWRS (see [Failure handling](#failure-handling)), not ignored.
 
 Adding policies to an MWRS automatically (default policies), and making some policies
 mandatory, are out of scope for alpha; see [open question 8](#open-questions).
@@ -1024,15 +1025,17 @@ agent, while the hub controller owns the object's spec and metadata. It already 
 The annotation has to change whenever the set of applied policies changes, including when the
 rendered spec does not. That happens: if `prod` is removed from an MWRS that also lists
 `prod-hotfix`, and `prod-hotfix` already overrode every field `prod` set, the spec is
-identical and only the provenance differs. `ManifestWorkEqual` does not detect this on its
-own, for two reasons. The two drift-detection sites copy the live object's `ObjectMeta` into
-the candidate, so its annotations always match. And the annotation check inside
-`ManifestWorkEqual` only asks whether the wanted keys are present with the wanted values, so
-a key that should be removed is never a difference.
+identical and only the provenance differs. The two drift-detection sites do not detect this
+today. `ManifestWorkEqual` compares the annotation maps exactly, by length and by value, but
+both sites copy the live object's `ObjectMeta` into the candidate first, so the annotations
+it is given always match.
 
-The implementation therefore compares this one key exactly, at both drift-detection sites
-and in the apply path: it must be absent when no policy applied, and equal to the rendered
-value otherwise. A provenance-only change is applied like any other update. It does not
+The implementation therefore compares this one key at both drift-detection sites, against
+the rendered value: it must be absent when no policy applied, and equal to the rendered value
+otherwise. The rest of the live metadata is still copied, because comparing the whole map
+would report an annotation set by any other controller as drift. The apply path needs no
+change: its candidate is built from scratch, so `ManifestWorkEqual` already sees the
+difference there. A provenance-only change is applied like any other update. It does not
 change the `ManifestWork`'s generation, so the cluster returns to its previous rollout status
 on the next reconcile.
 
@@ -1303,8 +1306,9 @@ condition is removed when the list is emptied; that a missing referenced policy 
 work of a cluster the placement dropped, creates none for a newly selected cluster, and
 reports `PlacementRolledOut` as `Progressing`.
 
-**Webhook tests**: duplicate names in `overridePolicies` are rejected, and a name that does
-not exist yet is accepted. With the `ManifestOverridePolicy` gate off, the validating webhook
+**API and webhook tests**: the API server rejects duplicate names in `overridePolicies`, from
+the list-map marker and with no webhook involved, and a name that does not exist yet is
+accepted. With the `ManifestOverridePolicy` gate off, the validating webhook
 rejects a create with entries and an update that adds one, and allows an update that keeps or
 removes entries. A `ResourceOverrideSchema` whose `target` has only `group` and `resource`,
 as in the example, is accepted.
